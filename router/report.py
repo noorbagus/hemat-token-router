@@ -78,7 +78,9 @@ def aggregate_reports(report_paths: list[str]) -> StatsSummary:
     for path in report_paths:
         try:
             reports.append(load_report(path))
-        except (FileNotFoundError, json.JSONDecodeError, ValidationError):
+        except (OSError, json.JSONDecodeError, ValidationError):
+            # OSError covers FileNotFoundError, IsADirectoryError, PermissionError:
+            # a broken/missing file in the report dir must not crash `csmart stats`.
             continue
 
     if not reports:

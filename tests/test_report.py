@@ -89,6 +89,7 @@ def test_write_load_roundtrip(tmp_path) -> None:
 
     loaded = load_report(str(path))
     assert isinstance(loaded, CsmartReport)
+    assert loaded.schema_version == "1.0"
     assert loaded.status == report.status == "ok"
     assert loaded.estimated_tokens_saved == report.estimated_tokens_saved == 200
 
@@ -154,3 +155,20 @@ def test_load_report_propagates_garbage_json(tmp_path) -> None:
     except json.JSONDecodeError:
         return
     raise AssertionError("expected json.JSONDecodeError to propagate")
+
+
+def test_load_report_propagates_missing_file(tmp_path) -> None:
+    """load_report lets FileNotFoundError propagate (aggregate handles it)."""
+    missing_path = tmp_path / "missing.json"
+    try:
+        load_report(str(missing_path))
+    except FileNotFoundError:
+        return
+    raise AssertionError("expected FileNotFoundError to propagate")
+
+
+def test_aggregate_reports_skips_directory_path(tmp_path) -> None:
+    """IsADirectoryError in a report path is skipped, not fatal."""
+    summary = aggregate_reports([str(tmp_path)])
+    assert summary.report_count == 0
+    assert summary.status_counts == {}

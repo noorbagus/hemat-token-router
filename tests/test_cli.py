@@ -181,3 +181,60 @@ def test_main_cli_skips_path_traversal_selected_files(monkeypatch, tmp_path) -> 
     assert dispatched == [str(ok_file.resolve())]
     # The traversal candidates must never be read or forwarded.
     assert not any("secret" in p for p in dispatched)
+
+
+# --- Wave 4 Track B: logs / stats subcommands -------------------------
+
+
+def test_parse_logs_sets_command() -> None:
+    ns = build_parser().parse_args(["logs", "--tail", "5"])
+    assert ns.command == "logs"
+    assert ns.tail == 5
+    assert ns.follow is False
+
+
+def test_parse_stats_sets_command() -> None:
+    ns = build_parser().parse_args(["stats"])
+    assert ns.command == "stats"
+
+
+def test_parse_logs_event_and_follow() -> None:
+    ns = build_parser().parse_args(["logs", "--event", "OLLAMA_TRIAGE", "--follow"])
+    assert ns.command == "logs"
+    assert ns.event == "OLLAMA_TRIAGE"
+    assert ns.follow is True
+
+
+def test_main_cli_logs_calls_cmd_logs(monkeypatch) -> None:
+    """`main_cli(["logs", ...])` routes to cmd_logs with parsed flags."""
+    captured: dict[str, object] = {}
+
+    def fake_cmd_logs(log_dir, tail, follow, event) -> None:
+        captured["log_dir"] = log_dir
+        captured["tail"] = tail
+        captured["follow"] = follow
+        captured["event"] = event
+
+    monkeypatch.setattr(csmart, "cmd_logs", fake_cmd_logs)
+    result = csmart.main_cli(["logs", "--tail", "3"])
+    assert result is None
+    assert captured["log_dir"] == csmart.DEFAULT_LOG_DIR
+    assert captured["tail"] == 3
+    assert captured["follow"] is False
+    assert captured["event"] is None
+
+
+def test_main_cli_stats_calls_cmd_stats(monkeypatch) -> None:
+    """`main_cli(["stats"])` routes to cmd_stats once."""
+    called: list[tuple[object, object, object]] = []
+
+    def fake_cmd_stats(log_dir, report_dir, json_out) -> None:
+        called.append((log_dir, report_dir, json_out))
+
+    monkeypatch.setattr(csmart, "cmd_stats", fake_cmd_stats)
+    result = csmart.main_cli(["stats"])
+    assert result is None
+    assert len(called) == 1
+    assert called[0][0] == csmart.DEFAULT_LOG_DIR
+    assert called[0][1] == ".csmart"
+    assert called[0][2] is False

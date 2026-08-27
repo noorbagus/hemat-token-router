@@ -19,10 +19,11 @@ from collections.abc import Iterable
 import uvicorn
 
 from router.dispatcher import app, check_ollama_health, check_upstream_health
+from router.logs_viewer import DEFAULT_LOG_DIR, cmd_logs, cmd_stats
 
 
-# Known proxy subcommands (Track A: entrypoint + config)
-KNOWN_COMMANDS = ("start", "status")
+# Known proxy subcommands (Track A: entrypoint + config; Wave 4: logs/stats)
+KNOWN_COMMANDS = ("start", "status", "logs", "stats")
 
 # Default configuration constants (kept at module scope so build_parser() is
 # usable from tests without re-executing the CLI flow).
@@ -152,7 +153,9 @@ def build_parser() -> argparse.ArgumentParser:
             "csmart - Claude Smart Local Routing\n\n"
             'CLI mode:  csmart "your coding task prompt" [options]\n'
             "Proxy:     csmart start [--host X] [--port Y]\n"
-            "Health:    csmart status"
+            "Health:    csmart status\n"
+            "Logs:      csmart logs [--tail N] [--follow] [--event EVENT]\n"
+            "Stats:     csmart stats [--json]"
         ),
         parents=[shared],
     )
@@ -166,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(
         dest="command",
         title="commands",
-        metavar="{start,status}",
+        metavar="{start,status,logs,stats}",
     )
 
     start_p = subparsers.add_parser(
@@ -191,6 +194,36 @@ def build_parser() -> argparse.ArgumentParser:
         "status",
         parents=[shared],  # type: ignore[reportArgumentType]  # pyright binds the subparser TypeVar to CSmartParser
         help="Check health of Ollama and upstream gateway",
+    )
+
+    logs_p = subparsers.add_parser(
+        "logs",
+        parents=[shared],  # type: ignore[reportArgumentType]  # pyright binds the subparser TypeVar to CSmartParser
+        help="View structured JSONL logs",
+        epilog="Note: the inherited --json flag is accepted but unused for logs.",
+    )
+    logs_p.add_argument(
+        "--tail",
+        type=int,
+        default=20,
+        help="Number of most recent records to show (default: 20)",
+    )
+    logs_p.add_argument(
+        "--follow",
+        action="store_true",
+        help="Follow new log records as they are written (like tail -f)",
+    )
+    logs_p.add_argument(
+        "--event",
+        type=str,
+        default=None,
+        help="Only show records with this exact event name",
+    )
+
+    subparsers.add_parser(
+        "stats",
+        parents=[shared],  # type: ignore[reportArgumentType]  # pyright binds the subparser TypeVar to CSmartParser
+        help="Aggregate report statistics and log event counts",
     )
 
     # Dedicated CLI-mode parser (not a subparser) so `csmart "prompt"` keeps
@@ -267,6 +300,14 @@ def main_cli(argv: list[str] | None = None) -> None:
         cmd_start(args.host, args.port)
         return
 
+    if args.command == "logs":
+        cmd_logs(log_dir=DEFAULT_LOG_DIR, tail=args.tail, follow=args.follow, event=args.event)
+        return
+
+    if args.command == "stats":
+        cmd_stats(log_dir=DEFAULT_LOG_DIR, report_dir=os.path.dirname(args.report_path) or ".csmart", json_out=args.json)
+        return
+
     # CLI mode - requires prompt argument
     if args.prompt is None:
         parser.print_help()
@@ -313,6 +354,7 @@ def main_cli(argv: list[str] | None = None) -> None:
             gateway_config=gateway_config,
             claude_result=None,
             status=status,
+            skeleton_bytes=len(full_skeleton.encode("utf-8")),
         )
         report_path = args.report_path
         report_dir = os.path.dirname(report_path)
@@ -397,6 +439,7 @@ def main_cli(argv: list[str] | None = None) -> None:
         gateway_config=gateway_config,
         claude_result=dispatch_result,
         status=status,
+        skeleton_bytes=len(full_skeleton.encode("utf-8")),
     )
     report_path = args.report_path
     report_dir = os.path.dirname(report_path)
