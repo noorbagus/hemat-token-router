@@ -1,6 +1,16 @@
 # Changelog
 
 ## [Unreleased]
+### Performance (2026-08-28, issue #2 P0-P4)
+- **P0 — TTL routing cache**: session-less (production) requests reuse the routing per `context_dir` for `CSMART_ROUTING_TTL` (default 120s, cap 16) — Qwen is **no longer called on message 2+ per burst** (verified `cache_hit=true` @ 0ms). Log field `cache_hit`.
+- **P1 — triage model resident**: `keep_alive=-1` + `num_ctx=8192` in `ollama.chat()` — cold reload 18-26s eliminated.
+- **P2-server — Ollama env**: `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`, `OLLAMA_KEEP_ALIVE=-1`, `OLLAMA_MAX_LOADED_MODELS=1` (launchd plist; backup `.bak-20260828`). Measured prefill 139→214 t/s (+54%), decode 19→23 t/s (+21%).
+- **P3 — smaller routing input**: `_cap_skeleton` (preserves every `// <path>` header, env `CSMART_ROUTING_SKELETON_MAX_CHARS` default 6000) + `_truncate_routing_prompt` (keeps tail, env `CSMART_ROUTING_PROMPT_MAX_CHARS` default 4000). Skeleton 2,600→1,775 tokens; output JSON 61→35 tokens (reasoning ≤10 words, capped ≤120 chars, minified single-line).
+- **P4 — rounds counter fixed**: `SSE_STREAM_COMPLETE` logs `rounds=self.round - 1` (actual upstream calls) — single-round request now logs `rounds=1` (was 2).
+### Verified (live, 2026-08-28)
+- Warm `OLLAMA_TRIAGE` steady-state ≈ **2.5s** (was 4.7s) via prefix KV reuse; burst message 2+ = **0ms** routing (TTL cache hit); prefill cache-hit 15.7k-33k t/s; skeleton cap verified deterministic (26 `//` headers preserved).
+- 139 hermetic tests pass, pyright 0 errors.
+
 ### Fixed
 - S-1 header-whitelist comment corrected per live smoke (2026-08-28): the `ark.talaga.my.id` gateway accepts only `Authorization: Bearer` — `x-api-key` returns 401 — so Claude Code integration must set `ANTHROPIC_AUTH_TOKEN`, not `ANTHROPIC_API_KEY`. The allowlist is unchanged; only the comment was wrong.
 ### Verified (live smoke)

@@ -95,6 +95,54 @@ _ROUTING_CACHE_LOCK = threading.Lock()
 # LRU cap (P-1 review MAJOR): past sessions are cheap to re-route via Ollama,
 # so the cache never grows unbounded.
 _MAX_ROUTING_CACHE_ENTRIES = 128
+# P-0 routing TTL cache (2026-08-28): Claude Code sends no ``x-csmart-session``,
+# so the session cache above is dead in production (Qwen runs on every message,
+# ~75-80% of per-message latency). A short TTL cache keyed by context_dir reuses
+# a routing across a burst while bounding staleness: the confidence gate stays
+# fail-open and the default TTL is short (120s, env ``CSMART_ROUTING_TTL``).
+_ROUTING_TTL_CACHE: Dict[str, Tuple[float, RoutingResult]] = {}
+_ROUTING_TTL_CACHE_LOCK = threading.Lock()
+_MAX_ROUTING_TTL_ENTRIES = 16
+_DEFAULT_ROUTING_TTL_SECONDS = 120.0
+
+
+def _routing_ttl_seconds() -> float:
+    """TTL for the context-dir routing cache (env ``CSMART_ROUTING_TTL``)."""
+    raw = os.environ.get("CSMART_ROUTING_TTL", "")
+    if not raw:
+        return _DEFAULT_ROUTING_TTL_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _DEFAULT_ROUTING_TTL_SECONDS
+
+
+def _routing_ttl_lookup(context_dir: str) -> Optional[RoutingResult]:
+    """Return a fresh TTL-cached routing for ``context_dir``, else None.
+
+    Stale entries (older than the TTL) are evicted in place.
+    """
+    with _ROUTING_TTL_CACHE_LOCK:
+        entry = _ROUTING_TTL_CACHE.get(context_dir)
+        if entry is None:
+            return None
+        stored_ts, routing = entry
+        if time.monotonic() - stored_ts > _routing_ttl_seconds():
+            _ROUTING_TTL_CACHE.pop(context_dir, None)
+            return None
+        return routing
+
+
+def _routing_ttl_store(context_dir: str, routing: RoutingResult) -> None:
+    """Store a routing under ``context_dir``; evict the oldest entry over cap."""
+    with _ROUTING_TTL_CACHE_LOCK:
+        _ROUTING_TTL_CACHE[context_dir] = (time.monotonic(), routing)
+        if len(_ROUTING_TTL_CACHE) > _MAX_ROUTING_TTL_ENTRIES:
+            oldest = min(
+                _ROUTING_TTL_CACHE,
+                key=lambda k: _ROUTING_TTL_CACHE[k][0],
+            )
+            _ROUTING_TTL_CACHE.pop(oldest, None)
 
 
 class UpstreamError(Exception):
@@ -306,6 +354,66 @@ async def _get_or_scan_ast(context_dir: str) -> List[str]:
     return skeletons
 
 
+def _truncate_routing_prompt(prompt: str, max_chars: int | None = None) -> str:
+    """Keep the TAIL of a routing prompt so cold prefill stays small (P-2).
+
+    The current task statement sits at the end of the conversation prompt; the
+    head is history that Qwen does not need for file scoring. ``max_chars``
+    defaults to ``CSMART_ROUTING_PROMPT_MAX_CHARS`` (else 4000).
+    """
+    if max_chars is None:
+        try:
+            max_chars = int(os.environ.get("CSMART_ROUTING_PROMPT_MAX_CHARS", "4000"))
+        except ValueError:
+            max_chars = 4000
+    if len(prompt) <= max_chars:
+        return prompt
+    return prompt[-max_chars:]
+
+
+def _cap_skeleton(full_skeleton: str, max_chars: int | None = None) -> str:
+    """Cap the AST skeleton sent to Ollama while keeping every file header.
+
+    Lines starting with ``// `` are file headers (never removed); lines
+    starting with ``- `` are signatures. When over budget the longest signature
+    lines are dropped (trimming each file block's tail) so Qwen still sees all
+    files exist with a smaller prefill. ``max_chars`` defaults to
+    ``CSMART_ROUTING_SKELETON_MAX_CHARS`` (else 6000). Only the joined string is
+    capped — the ``_AST_CACHE`` entries are left untouched.
+    """
+    if max_chars is None:
+        try:
+            max_chars = int(os.environ.get("CSMART_ROUTING_SKELETON_MAX_CHARS", "6000"))
+        except ValueError:
+            max_chars = 6000
+    if len(full_skeleton) <= max_chars:
+        return full_skeleton
+
+    lines = full_skeleton.splitlines()
+    while len("\n".join(lines)) > max_chars:
+        longest_idx = -1
+        longest_len = -1
+        for i, line in enumerate(lines):
+            if line.startswith("- ") and len(line) > longest_len:
+                longest_len = len(line)
+                longest_idx = i
+        if longest_idx < 0:
+            break  # no signature lines left; only // headers remain
+        del lines[longest_idx]
+
+    # Path-only skeleton still over budget (not expected at 6000): keep the
+    # first N headers that fit.
+    if len("\n".join(lines)) > max_chars:
+        kept: List[str] = []
+        for line in lines:
+            if line.startswith("// "):
+                if len("\n".join(kept + [line])) <= max_chars:
+                    kept.append(line)
+        lines = kept
+
+    return "\n".join(lines)
+
+
 async def run_local_routing(
     prompt: str,
     session_key: str | None = None,
@@ -317,8 +425,9 @@ async def run_local_routing(
     Async and non-blocking (P-2): both the AST scan and the Ollama call run in
     worker threads. Routing is cached per session (P-1): the first
     ``/v1/messages`` for a ``x-csmart-session`` routes via Ollama; later
-    same-session requests reuse the result. No session header -> route every
-    request (AST still cached).
+    same-session requests reuse the result. Session-less requests (production)
+    reuse the routing via the context-dir TTL cache (P-0) instead of re-routing
+    every message (AST is still cached either way).
     """
     skeletons = await _get_or_scan_ast(context_dir)
     logger.log(
@@ -327,9 +436,10 @@ async def run_local_routing(
         context_dir=context_dir,
         scanned_files_count=len(skeletons),
     )
-    full_skeleton = "\n".join(skeletons)
+    full_skeleton = _cap_skeleton("\n".join(skeletons))
 
     t0 = time.monotonic()
+    cache_hit = False
     if session_key:
         with _ROUTING_CACHE_LOCK:
             routing = _ROUTING_CACHE.get(session_key)
@@ -345,9 +455,14 @@ async def run_local_routing(
                 if len(_ROUTING_CACHE) > _MAX_ROUTING_CACHE_ENTRIES:
                     _ROUTING_CACHE.popitem(last=False)  # evict oldest
     else:
-        routing = await asyncio.to_thread(
-            ollama_scorer.route_target_files, full_skeleton, prompt
-        )
+        routing = _routing_ttl_lookup(context_dir)
+        if routing is None:
+            routing = await asyncio.to_thread(
+                ollama_scorer.route_target_files, full_skeleton, prompt
+            )
+            _routing_ttl_store(context_dir, routing)
+        else:
+            cache_hit = True
     routing_ms = int((time.monotonic() - t0) * 1000)
 
     # apply_gate takes tokens (it converts to bytes internally); the old `* 4`
@@ -366,6 +481,7 @@ async def run_local_routing(
         selected_files=gate_result.selected_files,
         confidence=routing.confidence,
         duration_ms=routing_ms,
+        cache_hit=cache_hit,
     )
     return gate_result
 
@@ -510,7 +626,10 @@ class _ShadowStreamer:
                 SSE_STREAM_COMPLETE,
                 trace_id=self.trace_id,
                 duration_ms=self._elapsed_ms(),
-                rounds=self.round,
+                # P-4: self.round is incremented at the END of each _stream_round,
+                # so a single-round request reads 2 — log the actual upstream
+                # call count.
+                rounds=self.round - 1,
                 shadow_used=self.shadow_used,
                 status="error" if self._round_failed else "ok",
             )
@@ -956,7 +1075,7 @@ async def handle_messages_request(request: Request) -> Response:
 
     context_dir = _context_dir()
     gate_result = await run_local_routing(
-        prompt,
+        _truncate_routing_prompt(prompt),
         session_key=session_key,
         context_dir=context_dir,
         trace_id=trace_id,

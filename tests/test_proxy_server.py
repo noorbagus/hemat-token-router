@@ -161,6 +161,8 @@ def _hermetic(monkeypatch):
     monkeypatch.setattr(dispatcher, "_AST_CACHE", {})
     # Reset to a fresh instance of the module's cache type (OrderedDict LRU).
     monkeypatch.setattr(dispatcher, "_ROUTING_CACHE", type(dispatcher._ROUTING_CACHE)())
+    # P-0: reset the context-dir TTL routing cache so no test leaks routing state.
+    monkeypatch.setattr(dispatcher, "_ROUTING_TTL_CACHE", {})
     # Reset the per-IP rate-limit bucket store so no test leaks token state.
     monkeypatch.setattr(dispatcher, "_RATE_BUCKETS", type(dispatcher._RATE_BUCKETS)())
     monkeypatch.setattr(
@@ -714,3 +716,121 @@ def cwd_tmp(tmp_path):
         yield tmp_path
     finally:
         os.chdir(old_cwd)
+
+
+# ---------------------------------------------------------------------------
+# Routing input cap tests (P-2 prefill reduction: skeleton + prompt truncation).
+# ---------------------------------------------------------------------------
+
+
+def test_cap_skeleton_under_budget_unchanged():
+    """A skeleton already under the cap is returned byte-identical."""
+    skeleton = "// a.py\n- def foo()\n- class Bar:\n"
+    assert dispatcher._cap_skeleton(skeleton, max_chars=6000) == skeleton
+
+
+def test_cap_skeleton_preserves_headers_drops_longest_signatures():
+    """Over budget: every // header is kept, the longest - signatures go first."""
+    skeleton = "\n".join([
+        "// a.py",
+        "- short",
+        "- " + "x" * 50,
+        "- " + "y" * 40,
+        "// b.py",
+        "- " + "z" * 30,
+    ])
+    capped = dispatcher._cap_skeleton(skeleton, max_chars=60)
+    assert "// a.py" in capped
+    assert "// b.py" in capped
+    assert len(capped) <= 60
+    assert ("x" * 50) not in capped  # longest dropped first
+    assert ("y" * 40) not in capped
+    assert ("z" * 30) in capped       # shortest kept
+
+
+def test_cap_skeleton_path_only_fits_by_trimming_headers():
+    """Even a path-only skeleton over an absurdly small budget keeps the first N."""
+    skeleton = "\n".join(f"// file{i}.py" for i in range(10))
+    capped = dispatcher._cap_skeleton(skeleton, max_chars=30)
+    assert len(capped) <= 30
+    assert capped.count("// file") == 2  # only the first 2 headers fit
+
+
+def test_truncate_routing_prompt_keeps_tail():
+    """Long prompts are cut to the TAIL (the task statement lives at the end)."""
+    prompt = "A" * 100 + "TASK_AT_END"
+    truncated = dispatcher._truncate_routing_prompt(prompt, max_chars=20)
+    assert truncated == "A" * 9 + "TASK_AT_END"
+    assert len(truncated) == 20
+    assert truncated.endswith("TASK_AT_END")
+
+
+def test_truncate_routing_prompt_short_unchanged():
+    """A short prompt is returned unchanged."""
+    prompt = "short task"
+    assert dispatcher._truncate_routing_prompt(prompt, max_chars=4000) == prompt
+
+
+def test_run_local_routing_passes_capped_skeleton(monkeypatch):
+    """run_local_routing hands Ollama a skeleton capped to the env budget."""
+    seen: Dict[str, Any] = {}
+    monkeypatch.setenv("CSMART_ROUTING_SKELETON_MAX_CHARS", "120")
+    big_skeleton = "\n".join(
+        f"// file{i}.py\n" + "\n".join(
+            f"- def func_{i}_{j}()" for j in range(10)
+        )
+        for i in range(5)
+    )
+
+    def _route(skeleton, prompt):
+        seen["skeleton"] = skeleton
+        return RoutingResult(target_files=[], confidence=0.0, reasoning="capped")
+
+    monkeypatch.setattr(
+        "router.ast_extractor.scan_project_codebase",
+        lambda root_dir, ignore_dirs: [big_skeleton],
+    )
+    monkeypatch.setattr("router.ollama_scorer.route_target_files", _route)
+
+    _run(dispatcher.run_local_routing("task", session_key="cap-session"))
+
+    assert len(seen["skeleton"]) <= 120
+    for i in range(5):
+        assert ("// file%d.py" % i) in seen["skeleton"]
+
+
+def test_routing_ttl_cache_reuses_across_burst(monkeypatch):
+    """P-0: session-less requests in one burst route via Ollama only once."""
+    route_calls: List[str] = []
+
+    def _counting_route(skeleton, prompt):
+        route_calls.append(prompt)
+        return RoutingResult(target_files=["a.py"], confidence=0.8, reasoning="ttl")
+
+    monkeypatch.setattr("router.ollama_scorer.route_target_files", _counting_route)
+    monkeypatch.setattr(
+        "router.ast_extractor.scan_project_codebase",
+        lambda root_dir, ignore_dirs: ["// a.py\n- def a()\n"],
+    )
+
+    _run(dispatcher.run_local_routing("task one"))
+    _run(dispatcher.run_local_routing("task two"))
+
+    assert len(route_calls) == 1
+
+
+def test_routing_ttl_cache_expires_when_ttl_zero(monkeypatch):
+    """P-0: TTL=0 disables reuse — every session-less request re-routes."""
+    route_calls: List[str] = []
+    monkeypatch.setenv("CSMART_ROUTING_TTL", "0")
+
+    def _counting_route(skeleton, prompt):
+        route_calls.append(prompt)
+        return RoutingResult(target_files=[], confidence=0.0, reasoning="ttl0")
+
+    monkeypatch.setattr("router.ollama_scorer.route_target_files", _counting_route)
+
+    _run(dispatcher.run_local_routing("one"))
+    _run(dispatcher.run_local_routing("two"))
+
+    assert len(route_calls) == 2

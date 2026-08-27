@@ -63,6 +63,54 @@ def test_route_target_files_default_model_when_env_unset(monkeypatch) -> None:
     assert calls == [DEFAULT_TRIAGE_MODEL]
 
 
+def test_route_target_files_keep_alive_and_num_ctx(monkeypatch) -> None:
+    """Latency: keep_alive=-1 keeps triage model resident; num_ctx=8192 set."""
+    monkeypatch.delenv("OLLAMA_TRIAGE_MODEL", raising=False)
+    captured: dict = {}
+
+    def fake_chat(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(message=SimpleNamespace(content=JSON_OK))
+
+    monkeypatch.setattr(ollama, "chat", fake_chat)
+    route_target_files("// a.py\n", "fix a")
+    assert captured["keep_alive"] == -1
+    assert captured["options"]["num_ctx"] == 8192
+    assert captured["format"] == "json"
+    assert captured["options"]["temperature"] == 0.0
+
+
+def test_route_target_files_long_reasoning_truncated(monkeypatch) -> None:
+    """Long reasoning is truncated to ≤120 chars (decode-latency win)."""
+    long_reasoning = "r" * 300
+    payload = (
+        '{"target_files": ["a.py"], "confidence": 0.9, '
+        f'"reasoning": "{long_reasoning}"}}'
+    )
+    monkeypatch.delenv("OLLAMA_TRIAGE_MODEL", raising=False)
+
+    def fake_chat(**kwargs):
+        return SimpleNamespace(message=SimpleNamespace(content=payload))
+
+    monkeypatch.setattr(ollama, "chat", fake_chat)
+    result = route_target_files("// a.py\n", "fix a")
+    assert len(result.reasoning) <= 120
+    assert result.reasoning.endswith("...")
+    assert result.reasoning.startswith("r" * 117)
+
+
+def test_route_target_files_short_reasoning_unchanged(monkeypatch) -> None:
+    """Short reasoning stays intact (no over-truncation)."""
+    monkeypatch.delenv("OLLAMA_TRIAGE_MODEL", raising=False)
+
+    def fake_chat(**kwargs):
+        return SimpleNamespace(message=SimpleNamespace(content=JSON_OK))
+
+    monkeypatch.setattr(ollama, "chat", fake_chat)
+    result = route_target_files("// a.py\n", "fix a")
+    assert result.reasoning == "x"
+
+
 def test_keyword_heuristic_path_match_beats_signature_match() -> None:
     """T-4: a keyword hitting the real file's path must outrank the same keyword
     appearing only in another file's signature.

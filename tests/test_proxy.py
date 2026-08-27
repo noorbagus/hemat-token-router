@@ -35,6 +35,8 @@ def _hermetic(monkeypatch):
     monkeypatch.setattr(dispatcher, "_AST_CACHE", {})
     # Reset to a fresh instance of the module's cache type (OrderedDict LRU).
     monkeypatch.setattr(dispatcher, "_ROUTING_CACHE", type(dispatcher._ROUTING_CACHE)())
+    # P-0: reset the context-dir TTL routing cache so no test leaks routing state.
+    monkeypatch.setattr(dispatcher, "_ROUTING_TTL_CACHE", {})
     # Reset the per-IP rate-limit bucket store so no test leaks token state.
     monkeypatch.setattr(dispatcher, "_RATE_BUCKETS", type(dispatcher._RATE_BUCKETS)())
     monkeypatch.setattr(

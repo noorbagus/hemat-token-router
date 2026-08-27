@@ -40,12 +40,13 @@ Rules:
   {
     "target_files": list[str] (1-3 file paths, relative paths matching the skeleton),
     "confidence": float (0.0 to 1.0 indicating confidence in the selection),
-    "reasoning": string (short explanation why these files were selected)
+    "reasoning": string, short, ≤10 words (brief explanation why these files were selected)
   }
 - Select at most 3 files, prefer 1-2 when obvious.
 - Only include files that are explicitly relevant to the change.
 - If multiple files are closely related, you may include them.
 - If no obvious files found, return an empty list with low confidence.
+- Output minified single-line JSON — no newlines, no indentation, no extra whitespace.
 """
 
     user_message = f"""
@@ -66,8 +67,10 @@ Respond with JSON only.
                 {"role": "user", "content": user_message},
             ],
             format="json",
+            keep_alive=-1,
             options={
                 "temperature": 0.0,
+                "num_ctx": 8192,
             },
         )
 
@@ -88,6 +91,9 @@ Respond with JSON only.
             confidence = 0.5
         if not isinstance(reasoning, str):
             reasoning = "Ollama returned invalid reasoning type."
+        # Cap reasoning to keep routed JSON small (decode-latency win).
+        elif len(reasoning) > 120:
+            reasoning = reasoning[:117] + "..."
 
         return RoutingResult(
             target_files=target_files,
@@ -102,15 +108,61 @@ Respond with JSON only.
 
 def _keyword_heuristic(skeleton: str, user_prompt: str, error: str) -> RoutingResult:
     """
-    Simple fallback heuristic: count keyword matches per file from the skeleton.
+    Robust fallback heuristic: weighted keyword matching per file from the skeleton.
 
-    Expects each line in skeleton to start with file path.
+    Expects each line in skeleton to start with file path (// path) followed by
+    signature lines (- signature). Weighting:
+    - Match on file path: 3 points
+    - Match on function/class name: 2 points
+    - Match on signature content: 1 point
+    - Splits camel_case/snake_case identifiers into sub-keywords for better matching
     """
-    # Extract keywords from user prompt: lowercase, remove punctuation
-    keywords = set(re.findall(r"[a-zA-Z0-9_]+", user_prompt.lower()))
-    # Filter out common stop words
-    stop_words = {"the", "and", "for", "that", "with", "this", "change", "modify", "add", "remove", "file", "please", "want", "need"}
-    keywords = keywords - stop_words
+    # Expanded stop words - common English/development words that don't help routing
+    stop_words = {
+        "the", "and", "for", "that", "with", "this", "change", "modify", "add", "remove",
+        "file", "please", "want", "need", "fix", "bug", "error", "issue", "problem",
+        "refactor", "improve", "update", "new", "function", "class", "method", "code",
+        "implement", "feature", "make", "should", "can", "will", "would", "could",
+        "has", "have", "been", "done", "get", "set", "put", "let", "one", "two",
+        "into", "out", "up", "down", "over", "under", "from", "to", "a", "an",
+        "in", "on", "at", "by", "of", "it", "is", "are", "was", "were", "be",
+        "being", "been", "do", "does", "so", "not", "no", "yes", "but", "or",
+        "if", "then", "else", "when", "what", "where", "why", "how", "all",
+        "any", "some", "more", "most", "less", "many", "much", "few", "little"
+    }
+
+    # Extract all tokens from prompt, split camel_case/snake_case into sub-keywords
+    def split_identifier(token: str) -> list[str]:
+        """Split camelCase/snake_case into individual keywords."""
+        # Split snake_case
+        parts = token.split("_")
+        # Split camelCase
+        result = []
+        for part in parts:
+            if len(part) <= 2:
+                result.append(part)
+                continue
+            # Split on capital letters
+            matches = re.findall(r'[A-Z](?:[a-z]+|[A-Z]*(?=[A-Z]|$))', part)
+            if matches:
+                result.extend([m.lower() for m in matches])
+            else:
+                result.append(part.lower())
+        return result
+
+    # Extract all tokens from prompt
+    raw_tokens = set(re.findall(r"[a-zA-Z0-9_]+", user_prompt.lower()))
+    # Expand into keywords by splitting identifiers
+    keywords = set()
+    for token in raw_tokens:
+        if len(token) <= 2 or token.lower() in stop_words:
+            continue
+        keywords.add(token.lower())
+        for sub in split_identifier(token):
+            if len(sub) > 2 and sub.lower() not in stop_words:
+                keywords.add(sub.lower())
+
+    keywords = sorted(keywords)  # noqa
 
     if not keywords:
         return RoutingResult(
@@ -119,35 +171,42 @@ def _keyword_heuristic(skeleton: str, user_prompt: str, error: str) -> RoutingRe
             reasoning=f"Ollama failed ({error}). No keywords extracted from prompt.",
         )
 
-    # Parse skeleton into file blocks, count matches
-    file_counts: dict[str, int] = {}
+    # Parse skeleton into file blocks, count weighted matches
+    file_weights: dict[str, int] = {}
     current_file: Optional[str] = None
 
     for line in skeleton.splitlines():
         line = line.strip()
         if not line:
             continue
-        # ast_extractor emits a "// <path>" header per file, then "- <signature>"
-        # lines. Only header lines start a new file block; signature-line hits
-        # are attributed to the current file so they can never fabricate a
-        # pseudo-file entry (e.g. "- def tokenize()") in the selection.
+
+        # ast_extractor emits a "// <path>" header per file
         if line.startswith("//"):
             current_file = line[2:].strip()
-            if current_file not in file_counts:
-                file_counts[current_file] = 0
-        elif current_file is None:
+            if current_file not in file_weights:
+                file_weights[current_file] = 0
+            # File path matches get higher weight (3x)
+            line_lower = line.lower()
+            for keyword in keywords:
+                if keyword in line_lower:
+                    file_weights[current_file] += 3
             continue
-        # Count keyword matches in the line (path lines count too: a keyword
-        # matching the file path is the strongest routing signal).
+
+        if current_file is None:
+            continue
+
+        # Signature lines start with "- " - function/class names get 2x, rest 1x
         line_lower = line.lower()
+        is_signature = line.startswith("- ")
+        weight = 2 if is_signature else 1
         for keyword in keywords:
             if keyword in line_lower:
-                file_counts[current_file] += 1
+                file_weights[current_file] += weight
 
-    # Sort by count descending
-    sorted_files = sorted(file_counts.items(), key=lambda x: x[1], reverse=True)
-    # Take top 3 with count > 0
-    top_files = [f for f, cnt in sorted_files if cnt > 0][:3]
+    # Sort by total weight descending
+    sorted_files = sorted(file_weights.items(), key=lambda x: x[1], reverse=True)
+    # Take top 3 with weight > 0
+    top_files = [f for f, w in sorted_files if w > 0][:3]
 
     if not top_files:
         return RoutingResult(
@@ -156,9 +215,21 @@ def _keyword_heuristic(skeleton: str, user_prompt: str, error: str) -> RoutingRe
             reasoning=f"Ollama failed ({error}). No files matched any keywords.",
         )
 
-    max_count = sorted_files[0][1]
-    confidence = min(1.0, (max_count / (max(len(keywords), 1)))) * 0.8  # 0.8 max for heuristic
-    reasoning = f"Fallback heuristic: Ollama failed ({error}). Ranked by keyword match count."
+    # Improved confidence calculation:
+    # - Normalize by total possible points (3 points per keyword)
+    # - Cap at 0.8 to reflect heuristic uncertainty
+    # - Never exceed 1.0
+    max_weight = sorted_files[0][1]
+    total_possible = 3 * len(keywords)
+    confidence = min(0.8, max_weight / total_possible if total_possible > 0 else 0.0)
+
+    # Ensure confidence is within valid bounds
+    confidence = max(0.0, min(0.8, confidence))
+
+    reasoning = (
+        f"Fallback heuristic: Ollama failed ({error}). "
+        f"Ranked by weighted keyword matching (file path = 3x, signature = 2x)."
+    )
 
     return RoutingResult(
         target_files=top_files,
