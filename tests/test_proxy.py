@@ -35,6 +35,8 @@ def _hermetic(monkeypatch):
     monkeypatch.setattr(dispatcher, "_AST_CACHE", {})
     # Reset to a fresh instance of the module's cache type (OrderedDict LRU).
     monkeypatch.setattr(dispatcher, "_ROUTING_CACHE", type(dispatcher._ROUTING_CACHE)())
+    # Reset the per-IP rate-limit bucket store so no test leaks token state.
+    monkeypatch.setattr(dispatcher, "_RATE_BUCKETS", type(dispatcher._RATE_BUCKETS)())
     monkeypatch.setattr(
         "router.ast_extractor.scan_project_codebase",
         lambda root_dir, ignore_dirs: ["// mock.py\n- def mock()\n"],
@@ -47,20 +49,40 @@ def _hermetic(monkeypatch):
 
 
 def test_options_cors():
-    """CORS preflight OPTIONS returns the expected allow headers."""
+    """CORS preflight OPTIONS allows a loopback Origin and echoes it."""
 
     async def scenario():
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
-            resp = await client.options("/v1/messages")
+            resp = await client.options(
+                "/v1/messages", headers={"Origin": "http://127.0.0.1:3000"}
+            )
             return resp.status_code, dict(resp.headers)
 
     status, headers = _run(scenario())
     assert status == 200
-    assert headers["access-control-allow-origin"] == "*"
+    assert headers["access-control-allow-origin"] == "http://127.0.0.1:3000"
     assert headers["access-control-allow-methods"] == "*"
     assert headers["access-control-allow-headers"] == "*"
+
+
+def test_options_cors_non_loopback_origin_omitted():
+    """CORS preflight with a non-loopback Origin gets no allow-origin header."""
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.options(
+                "/v1/messages", headers={"Origin": "http://evil.example"}
+            )
+            return resp.status_code, dict(resp.headers)
+
+    status, headers = _run(scenario())
+    assert status == 200
+    assert "access-control-allow-origin" not in headers
+    assert headers["access-control-allow-methods"] == "*"
 
 
 def test_passthrough_with_mock_upstream(monkeypatch):

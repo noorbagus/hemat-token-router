@@ -1,8 +1,16 @@
 import json
+import os
 import re
 from typing import List, Optional
 from pydantic import BaseModel
 import ollama
+
+DEFAULT_TRIAGE_MODEL = "qwen2.5-coder:7b"
+
+
+def triage_model() -> str:
+    """Ollama triage model, overridable via ``OLLAMA_TRIAGE_MODEL``."""
+    return os.environ.get("OLLAMA_TRIAGE_MODEL", DEFAULT_TRIAGE_MODEL)
 
 
 class RoutingResult(BaseModel):
@@ -52,7 +60,7 @@ Respond with JSON only.
 
     try:
         response = ollama.chat(
-            model="qwen2.5-coder:7b",
+            model=triage_model(),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
@@ -119,22 +127,22 @@ def _keyword_heuristic(skeleton: str, user_prompt: str, error: str) -> RoutingRe
         line = line.strip()
         if not line:
             continue
-        # Detect new file: heuristic: lines starting with // are file paths (from ast_extractor)
+        # ast_extractor emits a "// <path>" header per file, then "- <signature>"
+        # lines. Only header lines start a new file block; signature-line hits
+        # are attributed to the current file so they can never fabricate a
+        # pseudo-file entry (e.g. "- def tokenize()") in the selection.
         if line.startswith("//"):
-            # Strip // prefix
-            line = line[2:].strip()
-        if line.startswith("./") or line.startswith("/") or (":" in line and "(" not in line) or line:
-            # Extract file path (before any colon)
-            file_path = line.split(":", 1)[0].strip()
-            current_file = file_path
+            current_file = line[2:].strip()
             if current_file not in file_counts:
                 file_counts[current_file] = 0
-        # Count keyword matches in the line
+        elif current_file is None:
+            continue
+        # Count keyword matches in the line (path lines count too: a keyword
+        # matching the file path is the strongest routing signal).
         line_lower = line.lower()
-        if current_file is not None:
-            for keyword in keywords:
-                if keyword in line_lower:
-                    file_counts[current_file] += 1
+        for keyword in keywords:
+            if keyword in line_lower:
+                file_counts[current_file] += 1
 
     # Sort by count descending
     sorted_files = sorted(file_counts.items(), key=lambda x: x[1], reverse=True)

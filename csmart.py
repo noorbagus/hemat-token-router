@@ -20,6 +20,7 @@ import uvicorn
 
 from router.dispatcher import app, check_ollama_health, check_upstream_health
 from router.logs_viewer import DEFAULT_LOG_DIR, cmd_logs, cmd_stats
+from router.ollama_scorer import triage_model
 
 
 # Known proxy subcommands (Track A: entrypoint + config; Wave 4: logs/stats)
@@ -247,7 +248,7 @@ def cmd_status() -> None:
     upstream_ok = asyncio.run(check_upstream_health())
 
     print("csmart health check:")
-    print(f"  Ollama (qwen2.5-coder:7b): {'✓ OK' if ollama_ok else '❌ NOT reachable/model not found'}")
+    print(f"  Ollama ({triage_model()}): {'✓ OK' if ollama_ok else '❌ NOT reachable/model not found'}")
     print(f"  Upstream gateway: {'✓ OK' if upstream_ok else '❌ NOT reachable'}")
 
     if ollama_ok and upstream_ok:

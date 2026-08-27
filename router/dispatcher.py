@@ -21,18 +21,19 @@ until the orchestrator repoints its imports.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from router import ast_extractor, ollama_scorer
 from router.gate import GateResult, apply_gate
@@ -45,7 +46,7 @@ from router.logger import (
     TOOL_SHADOW_INTERCEPT,
     logger,
 )
-from router.ollama_scorer import RoutingResult
+from router.ollama_scorer import RoutingResult, triage_model
 from router.safe_path import PathTraversalError, resolve_under_base
 from router.tool_shadow import (
     TOOL_NAMES,
@@ -112,18 +113,85 @@ def _context_dir() -> str:
     return os.environ.get("CSMART_CONTEXT_DIR", ".")
 
 
+# S-1 header whitelist: only allowlisted headers are forwarded upstream.
+# ``x-api-key`` deliberately stays in the default allowlist (deviation from the
+# original plan, which would have stripped it): Claude Code's Anthropic SDK
+# authenticates to the gateway via ``x-api-key`` by default and the proxy has no
+# token-injection mechanism, so it forwards the client's x-api-key as-is. The
+# real hardening win is stripping ``cookie``, ``user-agent``, ``sec-*``,
+# ``referer``, ``origin`` and every other non-allowlisted header (including the
+# internal ``x-csmart-session``, which stays local). An operator can drop
+# ``x-api-key`` via ``CSMART_HEADER_ALLOWLIST`` if their gateway accepts
+# ``authorization`` instead.
+_DEFAULT_HEADER_ALLOWLIST = frozenset({
+    "authorization", "x-api-key", "content-type", "accept",
+    "anthropic-version", "anthropic-beta", "x-app",
+})
+
+
+def _header_allowlist() -> frozenset[str]:
+    raw = os.environ.get("CSMART_HEADER_ALLOWLIST")
+    if not raw:
+        return _DEFAULT_HEADER_ALLOWLIST
+    return frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
+
+
 def _build_upstream_headers(request: Request) -> Dict[str, str]:
-    """Copy client headers, dropping hop-by-hop headers that will be regenerated."""
+    """Copy only allowlisted client headers upstream (S-1 header whitelist).
+
+    ``content-encoding`` is deliberately NOT forwarded (NIT): Claude Code sends
+    uncompressed JSON bodies, and forwarding a compressed body without the
+    matching header would corrupt the upstream read. If a client ever sends an
+    encoded body it is rejected/decoded downstream before it is re-sent.
+    """
+    allow = _header_allowlist()
     headers: Dict[str, str] = {}
     for name, value in request.headers.items():
-        if name.lower() not in ("host", "content-length"):
+        if name.lower() in allow:
             headers[name] = value
     return headers
 
 
+# P-5 request body cap: reject oversized bodies before routing/forwarding.
+_DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024  # 4 MiB
+
+
+def _max_body_bytes() -> int:
+    try:
+        return int(os.environ.get("CSMART_MAX_BODY_BYTES", str(_DEFAULT_MAX_BODY_BYTES)))
+    except ValueError:
+        return _DEFAULT_MAX_BODY_BYTES
+
+
+class BodyTooLargeError(Exception):
+    """Raised when a request body exceeds the configured byte cap."""
+
+
+async def _read_body_bounded(request: Request) -> bytes:
+    """Read the request body, aborting early once the configured cap is exceeded.
+
+    Uses ``request.stream()`` so a chunked/oversized body is rejected as soon as
+    the accumulated size passes the cap, without ever buffering the whole body
+    (P-5 MAJOR: OOM/DoS guard). The middleware's cheap Content-Length pre-check
+    still runs first for the declared-size fast path; this helper catches the
+    chunked / no-Content-Length case.
+    """
+    cap = getattr(request.state, "csmart_max_body_bytes", None)
+    if cap is None:
+        cap = _max_body_bytes()
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > cap:
+            raise BodyTooLargeError(f"request body exceeds {cap} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def read_full_body(request: Request) -> Dict[str, Any]:
-    """Read and parse the full JSON request body."""
-    body = await request.body()
+    """Read and parse the full JSON request body (size-bounded)."""
+    body = await _read_body_bounded(request)
     return json.loads(body)
 
 
@@ -698,26 +766,159 @@ class _ShadowStreamer:
 
 
 # ---------------------------------------------------------------------------
+# S-2 loopback enforcement + per-IP token-bucket rate limit.
+# ---------------------------------------------------------------------------
+
+def _is_loopback(host: str | None) -> bool:
+    """True if ``host`` is a loopback IP (``127.0.0.0/8``, ``::1``, IPv4-mapped).
+
+    Uses ``ipaddress`` so it also covers ``127.0.0.2-255``, ``::ffff:127.0.0.1``
+    and the hex form ``::ffff:7f00:1`` — not just the literal ``127.0.0.1``.
+    Returns False for a None host or a non-IP string (e.g. ``localhost``).
+    """
+    if not host:
+        return False
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _origin_loopback(origin: str | None) -> bool:
+    """True if the ``Origin`` header's host is a loopback address.
+
+    Used to gate CORS: only loopback-origin browsers get
+    ``Access-Control-Allow-Origin``. Claude Code CLI is not a browser and sends
+    no Origin, so this is defense-in-depth tightening of the loopback-only auth
+    claim, not a feature that any current client relies on.
+    """
+    if not origin:
+        return False
+    scheme_sep = origin.find("://")
+    rest = origin[scheme_sep + 3:] if scheme_sep != -1 else origin
+    if "@" in rest:
+        rest = rest.rsplit("@", 1)[1]
+    host = rest.split("/", 1)[0]
+    if host.startswith("["):  # IPv6 literal: "[::1]:3000" -> "::1"
+        host = host[1:host.find("]")]
+    else:
+        host = host.rsplit(":", 1)[0]  # strip port from IPv4/hostname
+    return _is_loopback(host)
+
+
+def _allow_external() -> bool:
+    return os.environ.get("CSMART_ALLOW_EXTERNAL") == "1"
+
+
+# Per-IP token buckets: ip -> [tokens, last_refill_ts]. Bounded LRU so the map
+# never grows unbounded under many distinct peer IPs.
+_RATE_BUCKETS: "OrderedDict[str, list[float]]" = OrderedDict()
+_RATE_BUCKETS_LOCK = threading.Lock()
+_MAX_RATE_BUCKETS = 1000
+
+
+def _rate_limit_per_min() -> float:
+    try:
+        return float(os.environ.get("CSMART_RATE_LIMIT_PER_MIN", "120"))
+    except ValueError:
+        return 120.0
+
+
+def _consume_token(ip: str, now: float, cap: float | None = None) -> bool:
+    """Try to consume one rate-limit token. Returns False -> caller must 429.
+
+    ``cap`` may be passed in by the caller so the env is read at most once per
+    request (NIT: ``_rate_limit_per_min()`` no longer re-read per call).
+    """
+    if cap is None:
+        cap = _rate_limit_per_min()
+    with _RATE_BUCKETS_LOCK:
+        bucket = _RATE_BUCKETS.get(ip)
+        if bucket is None:
+            _RATE_BUCKETS[ip] = [cap - 1.0, now]
+            _RATE_BUCKETS.move_to_end(ip)
+            if len(_RATE_BUCKETS) > _MAX_RATE_BUCKETS:
+                _RATE_BUCKETS.popitem(last=False)
+            return True
+        tokens, last = bucket
+        elapsed = max(0.0, now - last)
+        tokens = min(cap, tokens + elapsed * cap / 60.0)
+        if tokens < 1.0:
+            bucket[0], bucket[1] = tokens, now
+            return False
+        bucket[0], bucket[1] = tokens - 1.0, now
+        _RATE_BUCKETS.move_to_end(ip)
+        return True
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app + routes (absorbed from proxy.py).
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="csmart local reverse proxy", version="1.0")
 
 
+@app.middleware("http")
+async def _security_middleware(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Enforce loopback-only access, per-IP rate limit, and the body cap.
+
+    Order matters: loopback 403 first, then rate limit 429, then the cheap
+    Content-Length pre-check 413, then pass through to the route handlers. A
+    403/429/413 here never triggers routing or an upstream call.
+    """
+    peer = request.client.host if request.client else None
+    is_loopback = _is_loopback(peer)
+
+    if not _allow_external() and not is_loopback:
+        return JSONResponse({"error": "loopback_only"}, status_code=403)
+
+    # Loopback peers (Claude Code, editors, health checkers) share one local
+    # bucket; charging them tokens causes spurious 429s on busy sessions, so
+    # only non-loopback peers consume tokens.
+    rate_cap = _rate_limit_per_min()
+    if not is_loopback and not _consume_token(peer or "unknown", time.time(), rate_cap):
+        return JSONResponse(
+            {"error": "rate_limited"},
+            status_code=429,
+            headers={"Retry-After": "60"},
+        )
+
+    # Cheap Content-Length pre-check (P-5): reject oversized bodies for ALL
+    # methods without reading the body. The chunked/no-content-length case is
+    # caught later in ``_read_body_bounded``. The cap is stashed on the request
+    # state so the route handler reuses it instead of re-reading the env.
+    max_body = _max_body_bytes()
+    request.state.csmart_max_body_bytes = max_body
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared = int(content_length)
+        except ValueError:
+            declared = -1
+        if declared > max_body:
+            return JSONResponse({"error": "request_too_large"}, status_code=413)
+
+    return await call_next(request)
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
 async def proxy_handler(request: Request, path: str) -> Response:
     """Wildcard proxy handler — intercepts all requests and forwards."""
 
-    # CORS preflight.
+    # CORS preflight. Allow-origin is gated on the request's Origin host being
+    # loopback: a bare ``*`` would weaken the loopback-only auth claim, and
+    # Claude Code CLI is not a browser and needs no CORS.
     if request.method == "OPTIONS":
-        return Response(
-            status_code=200,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "*",
-                "Access-Control-Allow-Headers": "*",
-            },
-        )
+        headers: Dict[str, str] = {
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+        origin = request.headers.get("origin")
+        if origin is not None and _origin_loopback(origin):
+            headers["Access-Control-Allow-Origin"] = origin
+        return Response(status_code=200, headers=headers)
 
     # /v1/messages is intercepted and context-injected.
     if "/messages" in path and request.method == "POST":
@@ -731,8 +932,10 @@ async def handle_messages_request(request: Request) -> Response:
     """Intercept /v1/messages: route, inject context, forward with shadowing."""
     try:
         body = await read_full_body(request)
+    except BodyTooLargeError:
+        return JSONResponse({"error": "request_too_large"}, status_code=413)
     except json.JSONDecodeError as exc:
-        return Response(f"Invalid JSON: {exc}", status_code=400)
+        return JSONResponse({"error": f"invalid json: {exc}"}, status_code=400)
 
     trace_id = str(uuid4())
     logger.set_trace_id(trace_id)
@@ -820,7 +1023,10 @@ async def passthrough_request(request: Request, path: str) -> Response:
 
     body: Optional[bytes] = None
     if request.method not in ("GET", "HEAD"):
-        body = await request.body()
+        try:
+            body = await _read_body_bounded(request)
+        except BodyTooLargeError:
+            return JSONResponse({"error": "request_too_large"}, status_code=413)
 
     headers = _build_upstream_headers(request)
     timeout = _upstream_timeout()
@@ -872,7 +1078,7 @@ def check_ollama_health() -> bool:
     import ollama
 
     try:
-        ollama.show(OLLAMA_MODEL)
+        ollama.show(triage_model())
         return True
     except Exception:
         return False
