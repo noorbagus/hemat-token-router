@@ -7,6 +7,7 @@ then forwards modified request to upstream gateway and streams response back.
 
 import os
 import json
+import logging
 import httpx
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Request, Response
@@ -15,6 +16,9 @@ from fastapi.responses import StreamingResponse
 from router.ast_extractor import scan_project_codebase
 from router.ollama_scorer import route_target_files, RoutingResult
 from router.gate import apply_gate, GateResult
+from router.safe_path import resolve_under_base, PathTraversalError
+
+logger = logging.getLogger("csmart.proxy")
 
 
 # Default configuration from environment
@@ -41,17 +45,35 @@ def inject_context_to_messages(
     messages: List[Dict[str, Any]],
     selected_files: List[str],
 ) -> List[Dict[str, Any]]:
-    """Inject pre-loaded file context into the last user message."""
+    """Inject pre-loaded file context into the last user message.
+
+    Path-safety (F-09): every path in ``selected_files`` is validated through
+    :func:`router.safe_path.resolve_under_base` before being read. Paths that
+    escape the base dir (``..``, absolute-outside, symlink-outside) or that do
+    not exist are skipped with a warning; only files resolving inside ``.``
+    (CWD) are read.
+    """
     if not selected_files:
         return messages
 
-    # Read all selected files
+    # Read all selected files, skipping any that fail path validation
     context_blocks: List[str] = []
     for file_path in selected_files:
-        if os.path.exists(file_path):
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        try:
+            resolved = resolve_under_base(file_path, ".")
+        except PathTraversalError:
+            logger.warning("skipping path traversal attempt in selected file: %r", file_path)
+            continue
+        if not resolved.is_file():
+            logger.warning("skipping selected file (missing or not a regular file): %r", file_path)
+            continue
+        try:
+            with open(resolved, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
-                context_blocks.append(f"--- FILE START: {file_path} ---\n{content}\n--- FILE END ---\n")
+        except OSError as exc:
+            logger.warning("skipping unreadable selected file %r: %s", file_path, exc)
+            continue
+        context_blocks.append(f"--- FILE START: {file_path} ---\n{content}\n--- FILE END ---\n")
 
     if not context_blocks:
         return messages
