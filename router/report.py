@@ -6,9 +6,10 @@ gate/budget decisions, and dispatch outcome for automation/verification.
 
 import os
 import json
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from router.ollama_scorer import RoutingResult
 from router.gate import GateResult
@@ -47,6 +48,61 @@ class CsmartReport(BaseModel):
     estimated_tokens_saved: Optional[int] = None
 
 
+class StatsSummary(BaseModel):
+    """Aggregated statistics across multiple CsmartReport files."""
+
+    report_count: int
+    status_counts: dict[str, int]  # e.g. {"ok": 2, "gate_blocked": 1}
+    avg_prepass_ms: float | None
+    total_injected_bytes: int
+    total_tokens_saved: int
+
+
+def load_report(path: str) -> CsmartReport:
+    """Load a CsmartReport from a JSON file.
+
+    FileNotFoundError and json.JSONDecodeError propagate to the caller.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return CsmartReport.model_validate(data)
+
+
+def aggregate_reports(report_paths: list[str]) -> StatsSummary:
+    """Aggregate multiple report files into a StatsSummary.
+
+    Skips any path that is missing, contains invalid JSON, or fails
+    pydantic validation; the summary reflects only successfully parsed files.
+    """
+    reports: list[CsmartReport] = []
+    for path in report_paths:
+        try:
+            reports.append(load_report(path))
+        except (FileNotFoundError, json.JSONDecodeError, ValidationError):
+            continue
+
+    if not reports:
+        return StatsSummary(
+            report_count=0,
+            status_counts={},
+            avg_prepass_ms=None,
+            total_injected_bytes=0,
+            total_tokens_saved=0,
+        )
+
+    total_prepass_ms = sum(r.execution_metrics.total_prepass_ms for r in reports)
+    total_injected_bytes = sum(r.execution_metrics.injected_bytes for r in reports)
+    total_tokens_saved = sum(r.estimated_tokens_saved or 0 for r in reports)
+
+    return StatsSummary(
+        report_count=len(reports),
+        status_counts=dict(Counter(r.status for r in reports)),
+        avg_prepass_ms=total_prepass_ms / len(reports),
+        total_injected_bytes=total_injected_bytes,
+        total_tokens_saved=total_tokens_saved,
+    )
+
+
 def write_report(
     report: CsmartReport,
     report_path: str,
@@ -70,17 +126,17 @@ def create_report(
     gateway_config: GatewayConfig,
     claude_result: Optional[DispatchResult],
     status: str,
+    *,
+    skeleton_bytes: int | None = None,
 ) -> CsmartReport:
     """Create a complete CsmartReport with proper timestamp and metrics."""
     total_prepass = ast_scan_ms + local_routing_ms
 
-    # Estimate tokens saved: assume full context would be ~5x bigger (token saved)
-    estimated_saved = None
-    if injected_bytes > 0:
-        # Very rough estimate: 4 bytes per token, assume full scan would be 5x more
-        estimated_saved = int((injected_bytes * 4) // 4)  # injected is already injected bytes
-        # Actually estimate tokens saved vs full context (all files vs selected)
-        # We don't know full context size, so leave as None for now - could compute later
+    # Estimate tokens saved vs the full skeleton context (tokens ≈ bytes / 4).
+    if skeleton_bytes is not None:
+        estimated_tokens_saved = max(0, (skeleton_bytes - injected_bytes) // 4)
+    else:
+        estimated_tokens_saved = None
 
     return CsmartReport(
         status=status,
@@ -97,5 +153,5 @@ def create_report(
         gate_result=gate_result,
         gateway_config=gateway_config,
         claude_execution=claude_result,
-        estimated_tokens_saved=estimated_saved,
+        estimated_tokens_saved=estimated_tokens_saved,
     )
