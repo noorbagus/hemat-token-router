@@ -1,6 +1,6 @@
 [project]
 name = "csmart"
-version = "2.0.0"
+version = "2.1.0"
 description = "Claude Smart Local Routing - token-optimized CLI proxy with AST + Ollama pre-selection"
 authors = [
   { name = "hemat-token-router" }

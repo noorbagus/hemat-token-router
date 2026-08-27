@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.1.0] — 2026-08-28
+### Added
+- `router/report.py`: `StatsSummary` + `load_report()`/`aggregate_reports()` — `csmart stats` aggregates `.csmart/*.json` reports + per-event counts from session JSONL (R-3)
+- `router/logs_viewer.py`: `csmart logs` viewer (`--tail`, `--follow`, `--event`) — stdlib-only plain-text render, no new third-party deps (N-5); `csmart stats` subcommand (F-03)
+- F-13: `create_report(..., skeleton_bytes=...)` computes a real `estimated_tokens_saved` estimate (was `None`)
+- `OLLAMA_TRIAGE_MODEL` env override — `triage_model()` single source shared by routing, `csmart status`, and `check_ollama_health` (S-6)
+- RTK/DRIP dev tooling: `scripts/verify.sh` (RTK-safe test/typecheck/smoke gates), `scripts/drip-refresh.sh`, `DEVELOPMENT.md` (implements arsitektur §13.1)
+### Security
+- S-1: upstream header whitelist — only `authorization`, `x-api-key`, `content-type`, `accept`, `anthropic-version`, `anthropic-beta`, `x-app` forwarded; `cookie`/`user-agent`/`sec-*`/`origin` stripped (overridable via `CSMART_HEADER_ALLOWLIST`)
+- S-2: loopback-only enforcement (403) via `ipaddress.is_loopback` (covers `127.0.0.0/8`, `::1`, `::ffff:7f00:1`); per-IP token-bucket rate limit (429 + `Retry-After`, `CSMART_RATE_LIMIT_PER_MIN`) with loopback exempt; CORS allow-origin gated on loopback `Origin` (no bare `*`)
+- P-5: bounded body reader `_read_body_bounded()` (streaming early-abort over `request.stream()`) closes the chunked/no-Content-Length OOM bypass; Content-Length pre-check fast path; JSON `413`/`400` responses (`BodyTooLargeError`)
+### Fixed
+- `_keyword_heuristic` attribution bug: signature-line keyword hits fabricated pseudo-file entries (e.g. `- def check()`) — now attributed to the current file block (T-4 regression test)
+- `check_ollama_health` probed the legacy `OLLAMA_MODEL` — now probes `triage_model()`
+### Tests
+- 84 → 128 hermetic tests (Wave 4: report aggregator, logs viewer, CLI subparsers; Wave 5: loopback/rate-limit/body-cap/header-whitelist, model env, heuristic attribution)
+
 ## [2.0.0] — 2026-08-28
 ### Added
 - `router/safe_path.py` — symlink-aware path-traversal guard (`resolve_under_base`/`is_within`) + frozen inter-track contracts in `CONTRACTS.md`

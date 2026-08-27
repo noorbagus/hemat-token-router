@@ -202,3 +202,22 @@ def write_report(report: dict, path: Path) -> None
 - **Deferred (documented, non-blocking):** list-content injection in `inject_context_to_messages`, redaction depth (fields overwrite trace_id if passed), held-input reassembly seed, `round_had_held` dead var.
 
 **Final state:** `pytest tests/ -q` = 84 passed · `pyright router/ csmart.py` = 0 errors · `csmart --dry-run` report `status: ok`, gate `pass`.
+
+## Wave 4-6 — Execution Log (2026-08-28)
+
+| Wave | Scope | Verdict | Commit |
+|------|-------|---------|--------|
+| 4 | Fase 4 CLI & Metrics: report aggregator + F-13 real estimate (Track A), logs/stats viewer + F-03 subparser (Track B) — 2 parallel tracks | ✅ pyright 0, suite green | `faf8d53` · `08b1b2b` |
+| 5 | Fase 5 Hardening: S-1 header whitelist, S-2 loopback auth + rate limit, P-5 body cap (Track C), S-6 model env + T-4 heuristic attribution (Track D) — security review 1 MAJOR + 5 MINOR + 2 NIT all fixed | ✅ 128 tests, pyright 0 | `cc94dec` |
+| 6 | RTK/DRIP interference handling: arsitektur §13.1 + `scripts/verify.sh` + `scripts/drip-refresh.sh` + `DEVELOPMENT.md` | ✅ verified (bash -n, smoke) | `6f0337f` (docs) · `aaac640` (tooling) |
+
+**Wave-4 review fix loop:** 3 MINOR + NITs — logs_viewer empty-render returns `""`, `_read_new_records` glob `OSError` guard, `schema_version` assertion in report roundtrip, aggregate skips directory path.
+
+**Wave-5 security review fix loop:**
+- **MAJOR** — P-5 body cap checked only after `await request.body()` fully buffered → chunked/absent-Content-Length bypass → OOM/DoS. Fixed: `_read_body_bounded()` streaming accumulator over `request.stream()`, early abort at cap; used in both `read_full_body` and `passthrough_request`.
+- **MINOR** — 413/400 plain `Response` → `JSONResponse({"error": ...})`; `_is_loopback` → `ipaddress.ip_address(host).is_loopback`; rate limit now exempts loopback peers (shared local bucket caused spurious 429); `check_ollama_health` probes `triage_model()` (was legacy `OLLAMA_MODEL`); CORS `*` → gated on `_origin_loopback()`.
+- **NIT** — `_max_body_bytes()` computed once, stashed in `request.state.csmart_max_body_bytes`; `_consume_token(..., cap=)` reads env once per request; `content-encoding` deliberate non-forwarding comment.
+
+**Wave 4-6 orchestration notes (multi-agent SDLC):** sole git writer = orchestrator (subagents never commit); explicit per-wave `git add <path...>` (never `-A`); subagent DRIP baseline gap recovered via `drip refresh`; `_keyword_heuristic` regression test fails old code, passes new.
+
+**Final state (v2.1.0):** `pytest tests/ -q` = 128 passed · `pyright router/ csmart.py` = 0 errors · `csmart --dry-run` report `status: ok`.
