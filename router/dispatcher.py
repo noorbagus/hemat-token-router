@@ -47,6 +47,7 @@ from router.logger import (
     logger,
 )
 from router.ollama_scorer import RoutingResult, triage_model
+from router.routing_cache import LRURoutingCache, TTLRoutingCache
 from router.safe_path import PathTraversalError, resolve_under_base
 from router.tool_shadow import (
     TOOL_NAMES,
@@ -90,59 +91,15 @@ _UPSTREAM_TRANSPORT: Optional[httpx.AsyncBaseTransport] = None
 
 _AST_CACHE: Dict[str, List[str]] = {}
 _AST_CACHE_LOCK = threading.Lock()
-_ROUTING_CACHE: OrderedDict[str, RoutingResult] = OrderedDict()
-_ROUTING_CACHE_LOCK = threading.Lock()
-# LRU cap (P-1 review MAJOR): past sessions are cheap to re-route via Ollama,
-# so the cache never grows unbounded.
-_MAX_ROUTING_CACHE_ENTRIES = 128
-# P-0 routing TTL cache (2026-08-28): Claude Code sends no ``x-csmart-session``,
-# so the session cache above is dead in production (Qwen runs on every message,
-# ~75-80% of per-message latency). A short TTL cache keyed by context_dir reuses
-# a routing across a burst while bounding staleness: the confidence gate stays
-# fail-open and the default TTL is short (120s, env ``CSMART_ROUTING_TTL``).
-_ROUTING_TTL_CACHE: Dict[str, Tuple[float, RoutingResult]] = {}
-_ROUTING_TTL_CACHE_LOCK = threading.Lock()
-_MAX_ROUTING_TTL_ENTRIES = 16
-_DEFAULT_ROUTING_TTL_SECONDS = 120.0
-
-
-def _routing_ttl_seconds() -> float:
-    """TTL for the context-dir routing cache (env ``CSMART_ROUTING_TTL``)."""
-    raw = os.environ.get("CSMART_ROUTING_TTL", "")
-    if not raw:
-        return _DEFAULT_ROUTING_TTL_SECONDS
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return _DEFAULT_ROUTING_TTL_SECONDS
-
-
-def _routing_ttl_lookup(context_dir: str) -> Optional[RoutingResult]:
-    """Return a fresh TTL-cached routing for ``context_dir``, else None.
-
-    Stale entries (older than the TTL) are evicted in place.
-    """
-    with _ROUTING_TTL_CACHE_LOCK:
-        entry = _ROUTING_TTL_CACHE.get(context_dir)
-        if entry is None:
-            return None
-        stored_ts, routing = entry
-        if time.monotonic() - stored_ts > _routing_ttl_seconds():
-            _ROUTING_TTL_CACHE.pop(context_dir, None)
-            return None
-        return routing
-
-
-def _routing_ttl_store(context_dir: str, routing: RoutingResult) -> None:
-    """Store a routing under ``context_dir``; evict the oldest entry over cap."""
-    with _ROUTING_TTL_CACHE_LOCK:
-        _ROUTING_TTL_CACHE[context_dir] = (time.monotonic(), routing)
-        if len(_ROUTING_TTL_CACHE) > _MAX_ROUTING_TTL_ENTRIES:
-            oldest = min(
-                _ROUTING_TTL_CACHE,
-                key=lambda k: _ROUTING_TTL_CACHE[k][0],
-            )
-            _ROUTING_TTL_CACHE.pop(oldest, None)
+# Routing caches delegate to the tested classes in ``router.routing_cache``
+# (P-1 session LRU + P-0 context-dir TTL). Global names are kept stable so the
+# hermetic test fixtures can reset them per-test. The TTL cache reads the env
+# var ``CSMART_ROUTING_TTL`` via its internal env provider (default 120s, cap 16).
+_ROUTING_CACHE: LRURoutingCache = LRURoutingCache(max_entries=128)
+_ROUTING_TTL_CACHE: TTLRoutingCache = TTLRoutingCache(
+    max_entries=16,
+    default_ttl_seconds=120.0,
+)
 
 
 class UpstreamError(Exception):
@@ -441,26 +398,19 @@ async def run_local_routing(
     t0 = time.monotonic()
     cache_hit = False
     if session_key:
-        with _ROUTING_CACHE_LOCK:
-            routing = _ROUTING_CACHE.get(session_key)
-            if routing is not None:
-                _ROUTING_CACHE.move_to_end(session_key)  # LRU recency bump
+        routing = _ROUTING_CACHE.get(session_key)  # recency bump inside class
         if routing is None:
             routing = await asyncio.to_thread(
                 ollama_scorer.route_target_files, full_skeleton, prompt
             )
-            with _ROUTING_CACHE_LOCK:
-                _ROUTING_CACHE[session_key] = routing
-                _ROUTING_CACHE.move_to_end(session_key)
-                if len(_ROUTING_CACHE) > _MAX_ROUTING_CACHE_ENTRIES:
-                    _ROUTING_CACHE.popitem(last=False)  # evict oldest
+            _ROUTING_CACHE.put(session_key, routing)
     else:
-        routing = _routing_ttl_lookup(context_dir)
+        routing = _ROUTING_TTL_CACHE.get(context_dir)  # stale entries evicted
         if routing is None:
             routing = await asyncio.to_thread(
                 ollama_scorer.route_target_files, full_skeleton, prompt
             )
-            _routing_ttl_store(context_dir, routing)
+            _ROUTING_TTL_CACHE.put(context_dir, routing)
         else:
             cache_hit = True
     routing_ms = int((time.monotonic() - t0) * 1000)

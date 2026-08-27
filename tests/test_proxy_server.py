@@ -158,11 +158,12 @@ def _sse_n_tool_uses(count: int) -> str:
 @pytest.fixture(autouse=True)
 def _hermetic(monkeypatch):
     """Clear caches + patch routing to hermetic fixtures for every test."""
+    from router.routing_cache import LRURoutingCache, TTLRoutingCache
     monkeypatch.setattr(dispatcher, "_AST_CACHE", {})
-    # Reset to a fresh instance of the module's cache type (OrderedDict LRU).
-    monkeypatch.setattr(dispatcher, "_ROUTING_CACHE", type(dispatcher._ROUTING_CACHE)())
+    # Reset to a fresh instance of the module's cache types.
+    monkeypatch.setattr(dispatcher, "_ROUTING_CACHE", LRURoutingCache(max_entries=128))
     # P-0: reset the context-dir TTL routing cache so no test leaks routing state.
-    monkeypatch.setattr(dispatcher, "_ROUTING_TTL_CACHE", {})
+    monkeypatch.setattr(dispatcher, "_ROUTING_TTL_CACHE", TTLRoutingCache(max_entries=16, default_ttl_seconds=120.0))
     # Reset the per-IP rate-limit bucket store so no test leaks token state.
     monkeypatch.setattr(dispatcher, "_RATE_BUCKETS", type(dispatcher._RATE_BUCKETS)())
     monkeypatch.setattr(
@@ -834,3 +835,135 @@ def test_routing_ttl_cache_expires_when_ttl_zero(monkeypatch):
     _run(dispatcher.run_local_routing("two"))
 
     assert len(route_calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for the extracted routing_cache module.
+# ---------------------------------------------------------------------------
+
+
+def test_lru_cache_bounded_evicts_oldest():
+    """LRU cache respects max capacity and evicts least recently used."""
+    from router.routing_cache import LRURoutingCache
+    cache = LRURoutingCache(max_entries=3)
+
+    r1 = RoutingResult(target_files=["a.py"], confidence=1.0, reasoning="r1")
+    r2 = RoutingResult(target_files=["b.py"], confidence=1.0, reasoning="r2")
+    r3 = RoutingResult(target_files=["c.py"], confidence=1.0, reasoning="r3")
+    r4 = RoutingResult(target_files=["d.py"], confidence=1.0, reasoning="r4")
+
+    cache.put("k1", r1)
+    cache.put("k2", r2)
+    cache.put("k3", r3)
+    assert len(cache) == 3
+
+    # Access k1 to bump recency
+    assert cache.get("k1") == r1
+    # Add k4 - should evict k2 (oldest now)
+    cache.put("k4", r4)
+    assert len(cache) == 3
+
+    assert cache.get("k2") is None  # evicted
+    assert cache.get("k1") == r1   # still here (recently accessed)
+    assert cache.get("k3") == r3  # still here
+    assert cache.get("k4") == r4  # added
+
+
+def test_lru_cache_get_bumps_recency():
+    """Get on an existing entry moves it to the end of the LRU order."""
+    from router.routing_cache import LRURoutingCache
+    cache = LRURoutingCache(max_entries=3)
+
+    r1 = RoutingResult(target_files=["a.py"], confidence=1.0, reasoning="r1")
+    r2 = RoutingResult(target_files=["b.py"], confidence=1.0, reasoning="r2")
+    r3 = RoutingResult(target_files=["c.py"], confidence=1.0, reasoning="r3")
+    r4 = RoutingResult(target_files=["d.py"], confidence=1.0, reasoning="r4")
+
+    cache.put("k1", r1)
+    cache.put("k2", r2)
+    cache.put("k3", r3)
+
+    # Get k1 - now it's the most recent
+    assert cache.get("k1") == r1
+    # Add k4 should evict k2 (the new oldest) not k1
+    cache.put("k4", r4)
+    assert cache.get("k1") == r1
+    assert cache.get("k2") is None
+
+
+def test_ttl_cache_bounded_evicts_oldest():
+    """TTL cache respects max capacity and evicts oldest entry by timestamp."""
+    from router.routing_cache import TTLRoutingCache
+    # Fixed TTL provider that always returns 100s (enough for this test)
+    cache = TTLRoutingCache(
+        max_entries=3,
+        default_ttl_seconds=100.0,
+        ttl_seconds_provider=lambda: 100.0,
+    )
+
+    r1 = RoutingResult(target_files=["a.py"], confidence=1.0, reasoning="r1")
+    r2 = RoutingResult(target_files=["b.py"], confidence=1.0, reasoning="r2")
+    r3 = RoutingResult(target_files=["c.py"], confidence=1.0, reasoning="r3")
+    r4 = RoutingResult(target_files=["d.py"], confidence=1.0, reasoning="r4")
+
+    cache.put("k1", r1)
+    # We need to ensure different timestamps, so sleep a tiny bit
+    import time
+    time.sleep(0.001)
+    cache.put("k2", r2)
+    time.sleep(0.001)
+    cache.put("k3", r3)
+    assert len(cache) == 3
+
+    time.sleep(0.001)
+    cache.put("k4", r4)
+    assert len(cache) == 3
+
+    # Oldest (k1) should be evicted
+    assert cache.get("k1") is None
+    assert cache.get("k2") == r2
+    assert cache.get("k3") == r3
+    assert cache.get("k4") == r4
+
+
+def test_ttl_cache_expires_stale_entries():
+    """Expired entries are evicted on lookup and None is returned."""
+    from router.routing_cache import TTLRoutingCache
+    # TTL = 0 means everything is immediately stale
+    cache = TTLRoutingCache(
+        max_entries=3,
+        default_ttl_seconds=0.0,
+        ttl_seconds_provider=lambda: 0.0,
+    )
+    r1 = RoutingResult(target_files=["a.py"], confidence=1.0, reasoning="r1")
+    cache.put("k1", r1)
+    assert len(cache) == 1
+    # Lookup should expire it
+    assert cache.get("k1") is None
+    assert len(cache) == 0
+
+
+def test_ttl_cache_reads_env_ttl():
+    """TTL cache reads CSMART_ROUTING_TTL from environment when using default provider."""
+    import os
+    from router.routing_cache import TTLRoutingCache
+    # Save original env
+    orig = os.environ.get("CSMART_ROUTING_TTL")
+    try:
+        os.environ["CSMART_ROUTING_TTL"] = "60"
+        cache = TTLRoutingCache(max_entries=16, default_ttl_seconds=120.0)
+        assert cache.ttl_seconds() == 60.0
+
+        os.environ["CSMART_ROUTING_TTL"] = "invalid"
+        cache = TTLRoutingCache(max_entries=16, default_ttl_seconds=120.0)
+        assert cache.ttl_seconds() == 120.0  # fall back to default
+
+        os.environ.pop("CSMART_ROUTING_TTL", None)
+        cache = TTLRoutingCache(max_entries=16, default_ttl_seconds=120.0)
+        assert cache.ttl_seconds() == 120.0
+    finally:
+        # Restore original env
+        if orig is None:
+            os.environ.pop("CSMART_ROUTING_TTL", None)
+        else:
+            os.environ["CSMART_ROUTING_TTL"] = orig
