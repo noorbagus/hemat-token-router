@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from router.ollama_scorer import RoutingResult
 from router.gate import GateResult
-from router.dispatcher import DispatchResult
+from router.cli_dispatch import DispatchResult
 
 
 class ExecutionMetrics(BaseModel):

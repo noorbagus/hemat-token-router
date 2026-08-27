@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from router.proxy import inject_context_to_messages
+from router.dispatcher import inject_context_to_messages
 
 
 @pytest.fixture

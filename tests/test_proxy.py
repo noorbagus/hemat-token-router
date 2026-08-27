@@ -1,87 +1,124 @@
-"""Tests for the local reverse proxy."""
+"""Hermetic tests for the csmart reverse-proxy engine (``router.dispatcher``).
 
+No live network, no live Ollama: the ASGI app is driven with
+``httpx.ASGITransport`` and the upstream gateway is replaced with
+``httpx.MockTransport``. AST scanning and Ollama routing are patched with
+hermetic fixtures.
+
+Every test in this module is hermetic, so ``pytest -m "not live"`` runs the
+full module without touching the network. (No test here intentionally needs the
+real upstream, so none carries a ``pytest.mark.live`` marker.)
+"""
+
+import asyncio
+import sys
+from pathlib import Path
+
+import httpx
 import pytest
-from fastapi.testclient import TestClient
-from router.proxy import app
 
-client = TestClient(app)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from router.dispatcher import app
+from router.ollama_scorer import RoutingResult
+import router.dispatcher as dispatcher
+
+
+def _run(coro):
+    """Run a coroutine to completion with a fresh event loop."""
+    return asyncio.run(coro)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic(monkeypatch):
+    """Clear proxy caches + patch routing so no test touches Ollama/AST."""
+    monkeypatch.setattr(dispatcher, "_AST_CACHE", {})
+    monkeypatch.setattr(dispatcher, "_ROUTING_CACHE", {})
+    monkeypatch.setattr(
+        "router.ast_extractor.scan_project_codebase",
+        lambda root_dir, ignore_dirs: ["// mock.py\n- def mock()\n"],
+    )
+
+    def _route(skeleton, prompt):
+        return RoutingResult(target_files=[], confidence=0.0, reasoning="hermetic")
+
+    monkeypatch.setattr("router.ollama_scorer.route_target_files", _route)
 
 
 def test_options_cors():
-    """Test CORS preflight OPTIONS request."""
-    response = client.options("/v1/messages")
-    assert response.status_code == 200
-    assert "Access-Control-Allow-Origin" in response.headers
-    assert "Access-Control-Allow-Methods" in response.headers
-    assert "Access-Control-Allow-Headers" in response.headers
+    """CORS preflight OPTIONS returns the expected allow headers."""
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.options("/v1/messages")
+            return resp.status_code, dict(resp.headers)
+
+    status, headers = _run(scenario())
+    assert status == 200
+    assert headers["access-control-allow-origin"] == "*"
+    assert headers["access-control-allow-methods"] == "*"
+    assert headers["access-control-allow-headers"] == "*"
 
 
-def test_non_messages_passthrough():
-    """Test non-messages requests pass through untouched (we don't mock upstream, just check routing)."""
-    # This will fail upstream but we just check routing accepts it
-    response = client.get("/v1/models")
-    # Should get an error from upstream which means it passed through
-    assert response.status_code in (401, 403, 405, 500)  # auth error or method not allowed expected
+def test_passthrough_with_mock_upstream(monkeypatch):
+    """Non-messages requests pass through untouched via MockTransport."""
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.get("/v1/models")
+            return resp.status_code, resp.json()
+
+    monkeypatch.setattr(
+        dispatcher,
+        "_UPSTREAM_TRANSPORT",
+        httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"data": [{"id": "mock-model"}]})
+        ),
+    )
+
+    status, body = _run(scenario())
+    assert status == 200
+    assert body == {"data": [{"id": "mock-model"}]}
 
 
-def test_messages_interception_missing_auth():
-    """Test /v1/messages is intercepted, expects JSON."""
-    response = client.post("/v1/messages", json={
-        "model": "doubao-seed-2.0-lite",
-        "messages": [
-            {"role": "user", "content": "Hello world"}
-        ]
-    })
-    # Will fail upstream due to auth but routing worked
-    assert response.status_code in (401, 403, 500)
+def test_messages_intercepted_and_streamed(monkeypatch):
+    """/v1/messages is intercepted and the mocked SSE upstream is streamed back."""
 
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/v1/messages",
+                headers={"x-csmart-session": "s1"},
+                json={"model": "mock", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            return resp.status_code, resp.text
 
-def test_inject_context_to_messages():
-    """Test that context injection logic works on messages."""
-    from router.proxy import inject_context_to_messages
+    sse_body = (
+        "event: message_start\n"
+        'data: {"type":"message_start","message":{"id":"m1","role":"assistant","content":[],"model":"mock"}}\n\n'
+        "event: content_block_start\n"
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+        "event: content_block_delta\n"
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}\n\n'
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "_UPSTREAM_TRANSPORT",
+        httpx.MockTransport(
+            lambda req: httpx.Response(
+                200, text=sse_body, headers={"content-type": "text/event-stream"}
+            )
+        ),
+    )
 
-    # Simple case: one user message
-    messages = [
-        {"role": "user", "content": "Fix the indentation in csmart.py"},
-    ]
-    result = inject_context_to_messages(messages, ["csmart.py"])
-
-    assert len(result) == 1
-    assert "csmart.py" in result[0]["content"]
-    assert "PRE-LOADED CONTEXT" in result[0]["content"]
-    assert "--- FILE START: csmart.py ---" in result[0]["content"]
-
-
-def test_inject_context_preserves_system_message():
-    """Test context injection preserves existing system message."""
-    from router.proxy import inject_context_to_messages
-
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "Fix the indentation"},
-    ]
-    result = inject_context_to_messages(messages, ["csmart.py"])
-
-    assert len(result) == 2
-    assert result[0]["role"] == "system"
-    assert result[1]["role"] == "user"
-    assert "PRE-LOADED CONTEXT" in result[1]["content"]
-
-
-def test_inject_context_no_selected_files():
-    """Test when no files are selected, nothing changes."""
-    from router.proxy import inject_context_to_messages
-
-    messages = [
-        {"role": "user", "content": "Hello"},
-    ]
-    result = inject_context_to_messages(messages, [])
-
-    assert result == messages
-
-
-def test_pyright_ignored_types():
-    """Ignore type mismatch on FastAPI Request that pyright complains about - it's just a false positive."""
-    # This is just here to keep pytest happy - the issue is that pyright sees
-    # fastapi.Request vs httpx.Request type mismatch. It doesn't affect runtime.
-    pass
+    status, text = _run(scenario())
+    assert status == 200
+    assert '"type": "message_start"' in text
+    assert '"type": "content_block_delta"' in text
+    assert "hello" in text

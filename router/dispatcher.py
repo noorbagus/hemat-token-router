@@ -1,176 +1,835 @@
-import subprocess
-import time
-import os
+"""FastAPI reverse-proxy engine for csmart (absorbs ``router/proxy.py``).
+
+Wave 2 (Fase 3): this module replaces ``router/proxy.py`` as the single proxy
+engine. It owns the FastAPI app, the inbound interception pipeline
+(AST -> Ollama -> gate -> inject), the outbound SSE parser with exploration
+tool-use shadowing, and upstream reliability (timeout + bounded retry).
+
+Frozen public API (CONTRACTS.md §4):
+    app, handle_messages_request, forward_streaming_request,
+    check_ollama_health, check_upstream_health
+
+Absorbed names kept for backward compatibility with the old ``proxy.py``:
+    inject_context_to_messages, run_local_routing, passthrough_request,
+    proxy_handler
+
+CLI subprocess dispatch moved to ``router/cli_dispatch.py``; the two names are
+re-exported here only for the merge window so ``csmart.py`` stays importable
+until the orchestrator repoints its imports.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import json
-from typing import List, Optional
-from pydantic import BaseModel
-from dotenv import load_dotenv
+import logging
+import os
+import threading
+import time
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from uuid import uuid4
+
+import httpx
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse
+
+from router import ast_extractor, ollama_scorer
+from router.gate import GateResult, apply_gate
+from router.logger import (
+    AST_SCANNED,
+    INBOUND_REQUEST,
+    OLLAMA_TRIAGE,
+    SSE_STREAM_COMPLETE,
+    TOOL_LOCAL_EXEC,
+    TOOL_SHADOW_INTERCEPT,
+    logger,
+)
+from router.ollama_scorer import RoutingResult
+from router.safe_path import PathTraversalError, resolve_under_base
+from router.tool_shadow import (
+    TOOL_NAMES,
+    execute_local_tool,
+    summarize_exploration,
+)
+
+# Backward-compat re-exports for the merge window (orchestrator repoints csmart.py).
+from router.cli_dispatch import DispatchResult, dispatch_claude, read_file_content
+
+# ---------------------------------------------------------------------------
+# Configuration (environment-driven, defaults mirror proxy.py / CLAUDE.md).
+# ---------------------------------------------------------------------------
+
+UPSTREAM_BASE_URL = os.environ.get("ANTHROPIC_UPSTREAM_URL", "https://ark.talaga.my.id")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:7b")
+CONFIDENCE_THRESHOLD = float(os.environ.get("CSMART_THRESHOLD", "0.65"))
+DEFAULT_BUDGET_TOKENS = int(os.environ.get("CSMART_BUDGET", "16000"))
+DEFAULT_IGNORE_DIRS: set[str] = {
+    ".git", "node_modules", "dist", "build", ".next",
+    "venv", ".venv", ".dart_tool", "coverage", ".turbo", ".cache",
+    "__pycache__", ".pytest_cache",
+}
+
+# Upstream reliability (P-3): configurable timeout + bounded retry.
+MAX_UPSTREAM_RETRIES = 2
+# Shadow loop bound (N-4 / OD-3): at most this many exploration tool_use
+# blocks are held and resolved locally per request.
+MAX_SHADOW_ROUNDS = 3
+
+# stdlib logger used for caplog-compatible warnings (inject path-safety).
+_stdlib_logger = logging.getLogger("csmart.proxy")
+
+# Test/transport hook: when set, every upstream client uses this transport
+# (e.g. ``httpx.MockTransport`` in hermetic tests). Defaults to the real net.
+_UPSTREAM_TRANSPORT: Optional[httpx.AsyncBaseTransport] = None
+
+# ---------------------------------------------------------------------------
+# Caches (P-1): AST cache keyed by context_dir, routing cache keyed by session.
+# ---------------------------------------------------------------------------
+
+_AST_CACHE: Dict[str, List[str]] = {}
+_AST_CACHE_LOCK = threading.Lock()
+_ROUTING_CACHE: Dict[str, RoutingResult] = {}
+_ROUTING_CACHE_LOCK = threading.Lock()
 
 
-class DispatchResult(BaseModel):
-    """Result from Claude dispatch invocation"""
-    exit_code: int
-    duration_ms: int
-    cost_usd: Optional[float]
-    session_id: Optional[str]
-    result_excerpt: Optional[str]
-    dry_run: bool
+class UpstreamError(Exception):
+    """Raised when the upstream gateway is unreachable after retries."""
 
 
-class GateResult(BaseModel):
-    """Simplified gate result from gateway check"""
-    status: str  # "allowed", "fallback", "blocked"
-    message: str
-    fallback_model: Optional[str] = None
-
-
-def read_file_content(file_path: str) -> str:
-    """Read full content of a file"""
-    with open(file_path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def dispatch_claude(
-    files: List[str],
-    prompt: str,
-    gate_info: GateResult,
-    dry_run: bool = False
-) -> DispatchResult:
-    """
-    Dispatch a Claude CLI request with pre-loaded file context.
-
-    Args:
-        files: List of file paths to include in context
-        prompt: User's original task prompt
-        gate_info: Result from gateway checking
-        dry_run: If True, compose everything but don't invoke Claude
-
-    Returns:
-        DispatchResult with execution metadata
-    """
-    # Step 1: Read all selected files
-    file_contents = []
-    for file_path in files:
-        content = read_file_content(file_path)
-        file_contents.append(f"--- FILE: {file_path} ---\n{content}\n")
-
-    context_section = "\n".join(file_contents)
-
-    # Step 2: Compose final prompt
-    prompt_parts = [
-        f"USER TASK:\n{prompt}\n",
-        f"\n--- PRELOADED FILE CONTEXT ---\n{context_section}",
-        "\n--- INSTRUCTIONS ---",
-        "do NOT execute search tools (grep, find, ls) as full source files are pre-loaded above",
-    ]
-
-    # Add gate warning if needed
-    if gate_info.status == "fallback":
-        prompt_parts.append(f"\n\nGATEWAY NOTICE: Falling back to third-party model. Reason: {gate_info.message}")
-    elif gate_info.status == "blocked":
-        prompt_parts.append(f"\n\nGATEWAY NOTICE: Request blocked by gateway. Reason: {gate_info.message}")
-
-    final_prompt = "\n".join(prompt_parts)
-
-    # Step 3: Dry run exit early
-    if dry_run:
-        return DispatchResult(
-            exit_code=0,
-            duration_ms=0,
-            cost_usd=None,
-            session_id=None,
-            result_excerpt=f"Dry run: composed prompt with {len(files)} files, {len(final_prompt)} chars",
-            dry_run=True
-        )
-
-    # Step 4: Load gateway environment
-    gateway_env_path = "/Volumes/Xugab/LAB/PrivateLink/credentials/.env"
-    load_dotenv(gateway_env_path)
-
-    # Get auth token and configure third-party model
-    auth_token = os.getenv("ANTHROPIC_AUTH_TOKEN")
-    if not auth_token:
-        return DispatchResult(
-            exit_code=1,
-            duration_ms=0,
-            cost_usd=None,
-            session_id=None,
-            result_excerpt="Missing ANTHROPIC_AUTH_TOKEN in gateway .env",
-            dry_run=False
-        )
-
-    # Build command
-    cmd = [
-        "claude",
-        "-p", final_prompt,
-        "--output-format", "json",
-        "--max-turns", "1"
-    ]
-
-    # Prepare environment with model config for third-party
-    env = os.environ.copy()
-    env["ANTHROPIC_AUTH_TOKEN"] = auth_token
-    env["ANTHROPIC_BASE_URL"] = "https://ark.talaga.my.id"
-    # Model selection based on gate info
-    if gate_info.status == "fallback" and gate_info.fallback_model:
-        env["ANTHROPIC_MODEL"] = gate_info.fallback_model
-
-    # Step 5: Execute and measure
-    start_time = time.time()
+def _upstream_timeout() -> float:
     try:
-        result = subprocess.run(
-            cmd,
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False
-        )
-    except Exception as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        return DispatchResult(
-            exit_code=1,
-            duration_ms=duration_ms,
-            cost_usd=None,
-            session_id=None,
-            result_excerpt=f"Exception invoking Claude: {str(e)}",
-            dry_run=False
-        )
+        return float(os.environ.get("CSMART_UPSTREAM_TIMEOUT", "60"))
+    except ValueError:
+        return 60.0
 
-    duration_ms = int((time.time() - start_time) * 1000)
 
-    # Step 6: Parse output
-    exit_code = result.returncode
-    cost_usd: Optional[float] = None
-    session_id: Optional[str] = None
-    result_excerpt: Optional[str] = None
+def _context_dir() -> str:
+    """Root directory for AST scan / local tool execution."""
+    return os.environ.get("CSMART_CONTEXT_DIR", ".")
 
-    import json
-    if result.stdout:
+
+def _build_upstream_headers(request: Request) -> Dict[str, str]:
+    """Copy client headers, dropping hop-by-hop headers that will be regenerated."""
+    headers: Dict[str, str] = {}
+    for name, value in request.headers.items():
+        if name.lower() not in ("host", "content-length"):
+            headers[name] = value
+    return headers
+
+
+async def read_full_body(request: Request) -> Dict[str, Any]:
+    """Read and parse the full JSON request body."""
+    body = await request.body()
+    return json.loads(body)
+
+
+# ---------------------------------------------------------------------------
+# Inbound helpers.
+# ---------------------------------------------------------------------------
+
+
+def extract_last_user_prompt(messages: List[Dict[str, Any]]) -> str:
+    """Return the last user prompt as plain text.
+
+    Handles both plain-string content and list-of-blocks content (joins the
+    ``text`` blocks). Used for routing only — injection keeps its own,
+    string-only behavior.
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            if parts:
+                return "\n".join(parts)
+    return ""
+
+
+def inject_context_to_messages(
+    messages: List[Dict[str, Any]],
+    selected_files: List[str],
+) -> List[Dict[str, Any]]:
+    """Inject pre-loaded file context into the last user message.
+
+    Path-safety (F-09): every path in ``selected_files`` is validated through
+    :func:`router.safe_path.resolve_under_base` before being read. Paths that
+    escape the base dir (``..``, absolute-outside, symlink-outside) or that do
+    not exist are skipped with a warning; only files resolving inside ``.``
+    (CWD) are read.
+    """
+    if not selected_files:
+        return messages
+
+    context_blocks: List[str] = []
+    for file_path in selected_files:
         try:
-            output_json = json.loads(result.stdout)
-            cost_usd = output_json.get("cost_usd")
-            session_id = output_json.get("session_id")
-            # Take first 500 chars as excerpt
-            content = output_json.get("content", "")
-            if content:
-                result_excerpt = content[:500]
-                if len(content) > 500 and result_excerpt:
-                    result_excerpt += "..."
-        except json.JSONDecodeError:
-            result_excerpt = result.stdout[:500]
-            if len(result.stdout) > 500 and result_excerpt:
-                result_excerpt += "..."
+            resolved = resolve_under_base(file_path, ".")
+        except PathTraversalError:
+            _stdlib_logger.warning(
+                "skipping path traversal attempt in selected file: %r", file_path
+            )
+            continue
+        if not resolved.is_file():
+            _stdlib_logger.warning(
+                "skipping selected file (missing or not a regular file): %r", file_path
+            )
+            continue
+        try:
+            with open(resolved, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError as exc:
+            _stdlib_logger.warning(
+                "skipping unreadable selected file %r: %s", file_path, exc
+            )
+            continue
+        context_blocks.append(
+            f"--- FILE START: {file_path} ---\n{content}\n--- FILE END ---\n"
+        )
 
-    elif result.stderr:
-        result_excerpt = f"stderr: {result.stderr[:500]}"
-        if len(result.stderr) > 500:
-            result_excerpt = (result_excerpt or "") + "..."
+    if not context_blocks:
+        return messages
 
-    return DispatchResult(
-        exit_code=exit_code,
-        duration_ms=duration_ms,
-        cost_usd=cost_usd,
-        session_id=session_id,
-        result_excerpt=result_excerpt,
-        dry_run=False
+    injected_context = "\n".join([
+        "[PRE-LOADED CONTEXT - The following files contain the relevant source code you need to modify. DO NOT run grep/find/ls tool calls because the full content is already below.]\n\n",
+        *context_blocks,
+        "\nNow complete the user request above using this pre-loaded context. Modify the files directly.\n",
+    ])
+
+    new_messages = messages.copy()
+    for i in reversed(range(len(new_messages))):
+        if new_messages[i]["role"] == "user":
+            original_content = new_messages[i]["content"]
+            if isinstance(original_content, str):
+                new_content = f"{original_content}\n\n{injected_context}"
+                new_messages[i]["content"] = new_content
+            break
+
+    return new_messages
+
+
+async def _get_or_scan_ast(context_dir: str) -> List[str]:
+    """Scan the project once per context_dir (cached). Non-blocking (P-2)."""
+    key = os.path.abspath(context_dir)
+    with _AST_CACHE_LOCK:
+        cached = _AST_CACHE.get(key)
+    if cached is not None:
+        return cached
+    skeletons = await asyncio.to_thread(
+        ast_extractor.scan_project_codebase, context_dir, DEFAULT_IGNORE_DIRS
     )
+    with _AST_CACHE_LOCK:
+        _AST_CACHE[key] = skeletons
+    return skeletons
+
+
+async def run_local_routing(
+    prompt: str,
+    session_key: str | None = None,
+    context_dir: str = ".",
+) -> GateResult:
+    """Run local routing: AST scan (cached) -> Ollama scoring -> gate.
+
+    Async and non-blocking (P-2): both the AST scan and the Ollama call run in
+    worker threads. Routing is cached per session (P-1): the first
+    ``/v1/messages`` for a ``x-csmart-session`` routes via Ollama; later
+    same-session requests reuse the result. No session header -> route every
+    request (AST still cached).
+    """
+    skeletons = await _get_or_scan_ast(context_dir)
+    logger.log(
+        AST_SCANNED,
+        context_dir=context_dir,
+        scanned_files_count=len(skeletons),
+    )
+    full_skeleton = "\n".join(skeletons)
+
+    t0 = time.monotonic()
+    if session_key:
+        with _ROUTING_CACHE_LOCK:
+            routing = _ROUTING_CACHE.get(session_key)
+        if routing is None:
+            routing = await asyncio.to_thread(
+                ollama_scorer.route_target_files, full_skeleton, prompt
+            )
+            with _ROUTING_CACHE_LOCK:
+                _ROUTING_CACHE[session_key] = routing
+    else:
+        routing = await asyncio.to_thread(
+            ollama_scorer.route_target_files, full_skeleton, prompt
+        )
+    routing_ms = int((time.monotonic() - t0) * 1000)
+
+    budget_bytes = DEFAULT_BUDGET_TOKENS * 4
+    gate_result = await asyncio.to_thread(
+        apply_gate, routing, CONFIDENCE_THRESHOLD, budget_bytes
+    )
+    logger.log(
+        OLLAMA_TRIAGE,
+        session=session_key,
+        selected_files=gate_result.selected_files,
+        confidence=routing.confidence,
+        duration_ms=routing_ms,
+    )
+    return gate_result
+
+
+# ---------------------------------------------------------------------------
+# Upstream client + retry (P-3).
+# ---------------------------------------------------------------------------
+
+
+async def _request_upstream(
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    json_body: Dict[str, Any],
+) -> Tuple[httpx.AsyncClient, httpx.Response]:
+    """Send a request to upstream with bounded retry; return (client, resp).
+
+    The client is intentionally NOT closed here: the caller streams the
+    response and is responsible for closing both. Retries only happen on
+    connect/read/timeout transport errors. On terminal failure raises
+    :class:`UpstreamError`.
+    """
+    timeout = _upstream_timeout()
+    attempts = 0
+    while True:
+        client = httpx.AsyncClient(timeout=timeout, transport=_UPSTREAM_TRANSPORT)
+        try:
+            req = client.build_request(method, url, headers=headers, json=json_body)
+            resp = await client.send(req, stream=True)
+            return client, resp
+        except httpx.TransportError as exc:
+            await client.aclose()
+            attempts += 1
+            if attempts > MAX_UPSTREAM_RETRIES:
+                raise UpstreamError(
+                    f"upstream request failed after {attempts} attempts: {exc}"
+                ) from exc
+            await asyncio.sleep(0.25 * attempts)
+
+
+# ---------------------------------------------------------------------------
+# SSE parsing (N-3).
+# ---------------------------------------------------------------------------
+
+
+def _parse_sse_data(data_lines: List[str]) -> Dict[str, Any]:
+    """Join ``data:`` lines and JSON-decode them into a payload dict."""
+    raw = "\n".join(data_lines)
+    try:
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            return payload
+        return {
+            "type": "error",
+            "error": {"type": "invalid_payload", "message": raw[:200]},
+        }
+    except json.JSONDecodeError:
+        return {
+            "type": "error",
+            "error": {"type": "invalid_json", "message": raw[:200]},
+        }
+
+
+async def _iter_sse_events(resp: httpx.Response) -> AsyncGenerator[Tuple[Optional[str], Dict[str, Any]], None]:
+    """Parse an httpx streaming response into ``(event_name, payload)`` tuples."""
+    data_lines: List[str] = []
+    event_name: Optional[str] = None
+    async for raw_line in resp.aiter_lines():
+        line = raw_line.rstrip("\r")
+        if line == "":
+            if data_lines:
+                yield event_name, _parse_sse_data(data_lines)
+                data_lines = []
+                event_name = None
+            continue
+        if line.startswith("event:"):
+            event_name = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:"):].strip())
+    if data_lines:
+        yield event_name, _parse_sse_data(data_lines)
+
+
+# ---------------------------------------------------------------------------
+# Shadow loop (N-4 / QG-03 / QG-04).
+# ---------------------------------------------------------------------------
+
+
+class _ShadowStreamer:
+    """Drives the outbound SSE stream with exploration tool-use shadowing.
+
+    For each internal upstream round it forwards text deltas and non-exploration
+    tool_use to the client immediately (QG-04), holds exploration tool_use up to
+    ``MAX_SHADOW_ROUNDS`` per request (QG-03), executes them locally, then
+    re-submits the ``tool_result`` blocks upstream and continues with the new
+    round. When no more exploration tool_use is held, the round's closing SSE
+    events are flushed and the stream completes.
+    """
+
+    def __init__(
+        self,
+        method: str,
+        url: str,
+        headers: Dict[str, str],
+        body: Dict[str, Any],
+        session_key: Optional[str],
+        context_dir: str = ".",
+        trace_id: str | None = None,
+    ) -> None:
+        self.method = method
+        self.url = url
+        self.headers = headers
+        self.body = body
+        self.session_key = session_key
+        self.context_dir = context_dir
+        self.trace_id = trace_id or str(uuid4())
+        self.round = 1
+        self.shadow_used = 0
+        self.client_index = 0
+        self._pending_held: List[Dict[str, Any]] = []
+        self._start_ts = time.monotonic()
+
+    # -- public driver -------------------------------------------------
+
+    async def run(self) -> AsyncGenerator[bytes, None]:
+        """Yield SSE bytes to the client, looping internal shadow rounds."""
+        try:
+            while True:
+                messages = self.body.get("messages", [])
+                self._pending_held = []
+                async for chunk in self._stream_round(messages):
+                    yield chunk
+                held = self._pending_held
+                if not held:
+                    break
+                self.body = {
+                    **self.body,
+                    "messages": self._build_followup(messages, held),
+                }
+            logger.log(
+                SSE_STREAM_COMPLETE,
+                trace_id=self.trace_id,
+                duration_ms=self._elapsed_ms(),
+                rounds=self.round,
+                shadow_used=self.shadow_used,
+            )
+        except UpstreamError as exc:
+            payload = {
+                "type": "error",
+                "error": {"type": "api_error", "message": str(exc)},
+            }
+            yield self._format_event("error", payload)
+            logger.log(
+                SSE_STREAM_COMPLETE,
+                trace_id=self.trace_id,
+                status="error",
+                error=str(exc),
+            )
+            return
+
+    # -- per-round processing -------------------------------------------
+
+    async def _stream_round(self, messages: List[Dict[str, Any]]) -> AsyncGenerator[bytes, None]:
+        """Stream one upstream round. Sets ``self._pending_held`` on exit."""
+        try:
+            client, resp = await _request_upstream(
+                self.method, self.url, self.headers, {**self.body, "messages": messages}
+            )
+        except UpstreamError as exc:
+            payload = {
+                "type": "error",
+                "error": {"type": "api_error", "message": str(exc)},
+            }
+            yield self._format_event("error", payload)
+            return
+
+        if resp.status_code >= 400:
+            body_text = (await resp.aread()).decode("utf-8", errors="replace")
+            await resp.aclose()
+            await client.aclose()
+            payload = {
+                "type": "error",
+                "error": {
+                    "type": "upstream_error",
+                    "message": f"upstream returned {resp.status_code}: {body_text[:200]}",
+                },
+            }
+            yield self._format_event("error", payload)
+            return
+
+        held_indices: set[int] = set()
+        held_by_index: Dict[int, Dict[str, Any]] = {}
+        client_index_map: Dict[int, int] = {}
+        buffered_end: List[Tuple[Optional[str], Dict[str, Any]]] = []
+        round_had_held = False
+
+        try:
+            async for event_name, payload in _iter_sse_events(resp):
+                etype = payload.get("type", "")
+
+                if etype == "message_start":
+                    if self.round == 1:
+                        yield self._format_event(event_name, payload)
+                    continue
+
+                if etype in ("message_delta", "message_stop"):
+                    buffered_end.append((event_name, payload))
+                    continue
+
+                if etype == "content_block_start":
+                    index = payload.get("index")
+                    if not isinstance(index, int):
+                        yield self._format_event(event_name, payload)
+                        continue
+                    cb = payload.get("content_block", {})
+                    is_tool_use = cb.get("type") == "tool_use"
+                    name = cb.get("name", "")
+                    if (
+                        isinstance(index, int)
+                        and is_tool_use
+                        and name in TOOL_NAMES
+                        and self.shadow_used < MAX_SHADOW_ROUNDS
+                    ):
+                        self.shadow_used += 1
+                        round_had_held = True
+                        held_indices.add(index)
+                        base_input = cb.get("input")
+                        held_by_index[index] = {
+                            "index": index,
+                            "id": cb.get("id"),
+                            "name": name,
+                            "input_parts": (
+                                [json.dumps(base_input)] if isinstance(base_input, dict) and base_input else []
+                            ),
+                        }
+                        logger.log(
+                            TOOL_SHADOW_INTERCEPT,
+                            trace_id=self.trace_id,
+                            tool_name=name,
+                            action_taken="hold",
+                        )
+                        continue
+                    new_index = self.client_index
+                    self.client_index += 1
+                    client_index_map[index] = new_index
+                    payload = dict(payload)
+                    payload["index"] = new_index
+                    yield self._format_event(event_name, payload)
+                    continue
+
+                if etype == "content_block_delta":
+                    index = payload.get("index")
+                    if not isinstance(index, int):
+                        yield self._format_event(event_name, payload)
+                        continue
+                    if index in held_indices:
+                        delta = payload.get("delta", {})
+                        partial = delta.get("partial_json", "") if isinstance(delta, dict) else ""
+                        if isinstance(partial, str):
+                            held_by_index[index]["input_parts"].append(partial)
+                        continue
+                    new_index = client_index_map.get(index)
+                    if new_index is None:
+                        continue
+                    payload = dict(payload)
+                    payload["index"] = new_index
+                    yield self._format_event(event_name, payload)
+                    continue
+
+                if etype == "content_block_stop":
+                    index = payload.get("index")
+                    if not isinstance(index, int):
+                        yield self._format_event(event_name, payload)
+                        continue
+                    if index in held_indices:
+                        continue
+                    new_index = client_index_map.get(index)
+                    if new_index is None:
+                        continue
+                    payload = dict(payload)
+                    payload["index"] = new_index
+                    yield self._format_event(event_name, payload)
+                    continue
+
+                if etype == "ping":
+                    yield self._format_event(event_name, payload)
+                    continue
+
+                if etype == "error":
+                    # Upstream sent an SSE error; forward and stop the round.
+                    yield self._format_event(event_name, payload)
+                    return
+
+                # Unknown event type: forward untouched.
+                yield self._format_event(event_name, payload)
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+        self.round += 1
+
+        if held_indices:
+            self._pending_held = await self._execute_held(
+                [held_by_index[i] for i in sorted(held_indices)]
+            )
+            return
+
+        # No held blocks this round -> flush the closing SSE events.
+        for event_name, payload in buffered_end:
+            yield self._format_event(event_name, payload)
+
+    # -- helpers ---------------------------------------------------------
+
+    async def _execute_held(
+        self, held_blocks: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Execute each held exploration tool locally (parallel) and summarize."""
+
+        async def _exec(block: Dict[str, Any]) -> Dict[str, Any]:
+            tool_input = self._join_input(block["input_parts"])
+            raw = await execute_local_tool(block["name"], tool_input, self.context_dir)
+            logger.log(
+                TOOL_LOCAL_EXEC,
+                trace_id=self.trace_id,
+                tool_name=block["name"],
+                chars=len(raw),
+            )
+            summarized = await summarize_exploration(block["name"], raw)
+            return {**block, "input": tool_input, "content": summarized}
+
+        return await asyncio.gather(*[_exec(b) for b in held_blocks])
+
+    @staticmethod
+    def _join_input(parts: List[str]) -> Dict[str, Any]:
+        """Reassemble ``partial_json`` fragments into a tool input dict."""
+        raw = "".join(parts)
+        if not raw.strip():
+            return {}
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        return {"_partial_json": raw}
+
+    def _build_followup(
+        self, messages: List[Dict[str, Any]], held: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Append the assistant tool_use + user tool_result turns."""
+        assistant_content: List[Dict[str, Any]] = []
+        user_results: List[Dict[str, Any]] = []
+        for block in held:
+            assistant_content.append(
+                {
+                    "type": "tool_use",
+                    "id": block["id"],
+                    "name": block["name"],
+                    "input": block.get("input", {}),
+                }
+            )
+            user_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block["id"],
+                    "content": block.get("content", ""),
+                }
+            )
+        followup = list(messages)
+        if assistant_content:
+            followup.append({"role": "assistant", "content": assistant_content})
+        followup.append({"role": "user", "content": user_results})
+        return followup
+
+    @staticmethod
+    def _format_event(event_name: Optional[str], payload: Dict[str, Any]) -> bytes:
+        etype = str(payload.get("type") or event_name or "message")
+        return f"event: {etype}\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
+
+    def _elapsed_ms(self) -> int:
+        return int((time.monotonic() - self._start_ts) * 1000)
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app + routes (absorbed from proxy.py).
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="csmart local reverse proxy", version="1.0")
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
+async def proxy_handler(request: Request, path: str) -> Response:
+    """Wildcard proxy handler — intercepts all requests and forwards."""
+
+    # CORS preflight.
+    if request.method == "OPTIONS":
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "*",
+                "Access-Control-Allow-Headers": "*",
+            },
+        )
+
+    # /v1/messages is intercepted and context-injected.
+    if "/messages" in path and request.method == "POST":
+        return await handle_messages_request(request)
+
+    # Everything else passes through untouched.
+    return await passthrough_request(request, path)
+
+
+async def handle_messages_request(request: Request) -> Response:
+    """Intercept /v1/messages: route, inject context, forward with shadowing."""
+    try:
+        body = await read_full_body(request)
+    except json.JSONDecodeError as exc:
+        return Response(f"Invalid JSON: {exc}", status_code=400)
+
+    trace_id = str(uuid4())
+    logger.set_trace_id(trace_id)
+
+    messages = body.get("messages", [])
+    prompt = extract_last_user_prompt(messages)
+    session_key = request.headers.get("x-csmart-session")
+    logger.log(
+        INBOUND_REQUEST,
+        path=request.url.path,
+        session=session_key,
+        prompt_len=len(prompt),
+    )
+
+    context_dir = _context_dir()
+    gate_result = await run_local_routing(
+        prompt, session_key=session_key, context_dir=context_dir
+    )
+
+    modified_messages = inject_context_to_messages(messages, gate_result.selected_files)
+    body["messages"] = modified_messages
+
+    return await forward_streaming_request(
+        request, body, trace_id=trace_id, context_dir=context_dir
+    )
+
+
+async def forward_streaming_request(
+    request: Request,
+    body: Dict[str, Any],
+    trace_id: str | None = None,
+    context_dir: str = ".",
+) -> Response:
+    """Forward a streaming request to upstream and stream the SSE response back."""
+    if trace_id is None:
+        trace_id = str(uuid4())
+        logger.set_trace_id(trace_id)
+
+    upstream_path = request.url.path
+    upstream_url = f"{UPSTREAM_BASE_URL}{upstream_path}"
+    headers = _build_upstream_headers(request)
+    session_key = request.headers.get("x-csmart-session")
+
+    streamer = _ShadowStreamer(
+        method="POST",
+        url=upstream_url,
+        headers=headers,
+        body=body,
+        session_key=session_key,
+        context_dir=context_dir,
+        trace_id=trace_id,
+    )
+
+    async def gen() -> AsyncGenerator[bytes, None]:
+        async for chunk in streamer.run():
+            yield chunk
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+async def passthrough_request(request: Request, path: str) -> Response:
+    """Passthrough request untouched to upstream (buffered).
+
+    Non-``/v1/messages`` endpoints return small JSON bodies, so the upstream
+    response is buffered and returned as a plain :class:`Response`. This also
+    keeps ``httpx.MockTransport``-based tests hermetic (MockTransport marks a
+    ``stream=True`` response as already consumed, which breaks ``aiter_raw``).
+    """
+    upstream_url = f"{UPSTREAM_BASE_URL}/{path}"
+    query_params = dict(request.query_params)
+
+    body: Optional[bytes] = None
+    if request.method not in ("GET", "HEAD"):
+        body = await request.body()
+
+    headers = _build_upstream_headers(request)
+    timeout = _upstream_timeout()
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, transport=_UPSTREAM_TRANSPORT) as client:
+            req = client.build_request(
+                method=request.method,
+                url=upstream_url,
+                params=query_params,
+                headers=headers,
+                content=body,
+            )
+            resp = await client.send(req)
+            content = resp.content
+            status = resp.status_code
+            resp_headers = {
+                k: v for k, v in resp.headers.items() if k.lower() != "content-length"
+            }
+            media_type = resp.headers.get("content-type")
+    except Exception as exc:  # noqa: BLE001 - surface as 502
+        return Response(f"Upstream error: {exc}", status_code=502)
+
+    return Response(
+        content=content,
+        status_code=status,
+        headers=resp_headers,
+        media_type=media_type,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Health checks (absorbed from proxy.py).
+# ---------------------------------------------------------------------------
+
+
+async def check_upstream_health() -> bool:
+    """Check if the upstream gateway is reachable."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0, transport=_UPSTREAM_TRANSPORT) as client:
+            resp = await client.get(f"{UPSTREAM_BASE_URL}/v1/models")
+            return resp.status_code < 500
+    except Exception:
+        return False
+
+
+def check_ollama_health() -> bool:
+    """Check if Ollama is running and the model is available."""
+    import ollama
+
+    try:
+        ollama.show(OLLAMA_MODEL)
+        return True
+    except Exception:
+        return False

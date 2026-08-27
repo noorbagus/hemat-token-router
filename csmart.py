@@ -14,10 +14,11 @@ import asyncio
 import json
 import os
 import sys
+from collections.abc import Iterable
 
 import uvicorn
 
-from router.proxy import app, check_ollama_health, check_upstream_health
+from router.dispatcher import app, check_ollama_health, check_upstream_health
 
 
 # Known proxy subcommands (Track A: entrypoint + config)
@@ -44,13 +45,22 @@ class CSmartParser(argparse.ArgumentParser):
     to a dedicated CLI-only parser (set as ``_cli_parser`` by ``build_parser``).
     """
 
-    def parse_args(self, args=None, namespace=None):
+    _cli_parser: argparse.ArgumentParser | None = None
+
+    # Return type widened to Namespace | None to match typeshed's parse_args
+    # overload resolution (returns Namespace | None when namespace is passed).
+    # This override never returns None in practice (argparse exits on help/error).
+    def parse_args(  # type: ignore[reportIncompatibleMethodOverride]
+        self,
+        args: Iterable[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace | None:
         argv = list(args) if args is not None else sys.argv[1:]
         first = self._first_positional(argv)
         if first in KNOWN_COMMANDS:
             # Known subcommand -> let argparse's subparsers handle it.
             return super().parse_args(argv, namespace)
-        cli_parser = getattr(self, "_cli_parser", None)
+        cli_parser = self._cli_parser
         if first is not None and cli_parser is not None:
             # Anything else is a CLI-mode prompt.
             return cli_parser.parse_args(argv, namespace)
@@ -161,7 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     start_p = subparsers.add_parser(
         "start",
-        parents=[shared],
+        parents=[shared],  # type: ignore[reportArgumentType]  # pyright binds the subparser TypeVar to CSmartParser
         help="Run the local reverse proxy server",
     )
     start_p.add_argument(
@@ -179,7 +189,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser(
         "status",
-        parents=[shared],
+        parents=[shared],  # type: ignore[reportArgumentType]  # pyright binds the subparser TypeVar to CSmartParser
         help="Check health of Ollama and upstream gateway",
     )
 
@@ -231,10 +241,10 @@ def main_cli(argv: list[str] | None = None) -> None:
     import time
     from typing import Optional
     from router.ast_extractor import scan_project_codebase
-    from router.ollama_scorer import route_target_files, RoutingResult
-    from router.gate import apply_gate, GateResult
-    from router.dispatcher import dispatch_claude, DispatchResult
-    from router.report import CsmartReport, GatewayConfig, create_report, write_report
+    from router.ollama_scorer import route_target_files
+    from router.gate import apply_gate
+    from router.cli_dispatch import dispatch_claude, DispatchResult
+    from router.report import GatewayConfig, create_report, write_report
 
     # Default configuration constants
     DEFAULT_IGNORE_DIRS = {
@@ -245,6 +255,7 @@ def main_cli(argv: list[str] | None = None) -> None:
 
     parser = build_parser()
     args = parser.parse_args(argv)
+    assert args is not None  # parse_args never returns None (argparse exits on help/error)
 
     # Handle proxy mode commands
     if args.command == "status":
@@ -338,6 +349,7 @@ def main_cli(argv: list[str] | None = None) -> None:
             gate_info=gate_result,
             dry_run=False,
         )
+        assert dispatch_result is not None  # dispatch_claude always returns a result
         status = "ok" if dispatch_result.exit_code == 0 else "dispatch_error"
     else:
         # Dry run - create a dry dispatch result
