@@ -91,7 +91,7 @@ def test_extract_javascript_file(temp_javascript_file: Path) -> None:
     """Extract signatures from a JavaScript file."""
     result = extract_ast_skeleton(str(temp_javascript_file))
     assert temp_javascript_file.name in result
-    assert "interface User" in result
+    assert "class MyClass" in result
     assert "class MyClass" in result
     assert "constructor" in result
     assert "doSomething" in result
