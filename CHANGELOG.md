@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+### Fixed
+- S-1 header-whitelist comment corrected per live smoke (2026-08-28): the `ark.talaga.my.id` gateway accepts only `Authorization: Bearer` — `x-api-key` returns 401 — so Claude Code integration must set `ANTHROPIC_AUTH_TOKEN`, not `ANTHROPIC_API_KEY`. The allowlist is unchanged; only the comment was wrong.
+### Verified (live smoke)
+- First live round-trip `csmart start → /v1/messages → ark.talaga.my.id`: HTTP 200, complete SSE (`message_start` → `content_block_delta` ×64 → `message_stop`), model reply returned; AST scan 25 files + Ollama triage ran; pipeline trace `status=ok`.
+
 ## [2.1.0] — 2026-08-28
 ### Added
 - `router/report.py`: `StatsSummary` + `load_report()`/`aggregate_reports()` — `csmart stats` aggregates `.csmart/*.json` reports + per-event counts from session JSONL (R-3)

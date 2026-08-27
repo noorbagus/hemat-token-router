@@ -115,14 +115,17 @@ def _context_dir() -> str:
 
 # S-1 header whitelist: only allowlisted headers are forwarded upstream.
 # ``x-api-key`` deliberately stays in the default allowlist (deviation from the
-# original plan, which would have stripped it): Claude Code's Anthropic SDK
-# authenticates to the gateway via ``x-api-key`` by default and the proxy has no
-# token-injection mechanism, so it forwards the client's x-api-key as-is. The
-# real hardening win is stripping ``cookie``, ``user-agent``, ``sec-*``,
-# ``referer``, ``origin`` and every other non-allowlisted header (including the
-# internal ``x-csmart-session``, which stays local). An operator can drop
-# ``x-api-key`` via ``CSMART_HEADER_ALLOWLIST`` if their gateway accepts
-# ``authorization`` instead.
+# original plan, which would have stripped it): the Anthropic SDK can send auth
+# either as ``Authorization: Bearer`` (``ANTHROPIC_AUTH_TOKEN``) or as
+# ``x-api-key`` (``ANTHROPIC_API_KEY``), and the proxy has no token-injection
+# mechanism, so it forwards whichever the client sends. Live-verified
+# 2026-08-28: the ``ark.talaga.my.id`` gateway REQUIRES ``authorization`` and
+# rejects ``x-api-key`` (401), so Claude Code must set ``ANTHROPIC_AUTH_TOKEN``
+# (Bearer), not ``ANTHROPIC_API_KEY``. The real hardening win is stripping
+# ``cookie``, ``user-agent``, ``sec-*``, ``referer``, ``origin`` and every other
+# non-allowlisted header (including the internal ``x-csmart-session``, which
+# stays local). An operator can drop ``x-api-key`` via
+# ``CSMART_HEADER_ALLOWLIST`` if their gateway accepts only ``authorization``.
 _DEFAULT_HEADER_ALLOWLIST = frozenset({
     "authorization", "x-api-key", "content-type", "accept",
     "anthropic-version", "anthropic-beta", "x-app",
