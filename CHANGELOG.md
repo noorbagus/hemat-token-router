@@ -1,6 +1,11 @@
 # Changelog
 
 ## [Unreleased]
+### A/B Test: request-count vs output correctness (2026-08-28)
+- `docs/ab-test-request-count.md` — proxy (csmart inject + shadow) vs direct agent loop pada 2 task refactor: ARK calls **10→1** (S1) dan **≥12→2** (S2) = savings request 83-90%.
+- **Output verification negatif**: kedua output proxy **tidak dapat dipakai** (S2 = patch malformed + constructor fiktif `max_size`/`env_ttl_key`; S1 = implementasi duplikat `routing_cache.py`). Working tree baseline sudah 15 test gagal (WIP migrasi cache setengah jadi) dan output model tidak memperbaikinya. Savings request real, tapi value belum terbukti.
+- Root cause: triage tidak ikut sertakan file yang di-import target (`routing_cache.py`); shadow summarize file `.py` >4000 char menghilangkan detail signature API; tidak ada execution/test feedback loop di jalur proxy.
+
 ### Performance (2026-08-28, issue #2 P0-P4)
 - **P0 — TTL routing cache**: session-less (production) requests reuse the routing per `context_dir` for `CSMART_ROUTING_TTL` (default 120s, cap 16) — Qwen is **no longer called on message 2+ per burst** (verified `cache_hit=true` @ 0ms). Log field `cache_hit`.
 - **P1 — triage model resident**: `keep_alive=-1` + `num_ctx=8192` in `ollama.chat()` — cold reload 18-26s eliminated.
