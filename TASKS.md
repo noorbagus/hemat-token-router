@@ -187,7 +187,7 @@ def write_report(report: dict, path: Path) -> None
 | 0 | git init + remote `noorbagus/hemat-token-router` (private) + baseline; freeze `CONTRACTS.md`; `router/safe_path.py` + tests | ✅ | `687901e` (baseline, lint fixes) |
 | 1 | Fase 0 entrypoint/config (A), proxy path safety (C), logger (D), tool_shadow (E) — 4 parallel builders | ✅ 83→84 tests | `687901e` (A) · `ff1310e` (C) · `af3a0a6` (D) · `cd95973` (E) |
 | 2 | dispatcher.py rewrite: FastAPI proxy engine, SSE shadow loop, routing cache, cli_dispatch split | ✅ 83 tests, pyright 0 | `3c07b27` · `cf79c12` |
-| 3 | reviewer → tester∥linter → changelog → **fix loop** (1 BLOCKER + 7 MAJOR + 2 MINOR) → final commit | ✅ 84 tests, pyright 0 | `b48d2c9` (review fixes) · `a1f3c5e` (release) |
+| 3 | reviewer → tester∥linter → changelog → **fix loop** (1 BLOCKER + 7 MAJOR + 2 MINOR) → final commit | ✅ 84 tests, pyright 0 | `1f614ab` (review fixes) · `49c8953` (release) |
 
 **Wave-3 review fix loop (all findings verified against code before fixing):**
 - **BLOCKER** — CLI Step 4 raw-read `gate_result.selected_files` (Ollama-chosen) and forwarded to dispatch_claude → exfiltration to upstream gateway. Fixed: every path validated via `resolve_under_base(file, context_dir)`; traversal/missing skipped; regression test `test_main_cli_skips_path_traversal_selected_files` added.
