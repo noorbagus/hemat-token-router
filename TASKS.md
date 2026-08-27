@@ -171,3 +171,34 @@ def write_report(report: dict, path: Path) -> None
 - [ ] `python csmart.py --dry-run --strict --threshold 0.99 ...` -> exit 2, report `gate_blocked` tertulis
 - [ ] Live smoke test (model sudah ter-pull): run nyata tanpa `--dry-run` pada task kecil, exit 0, `.csmart/last-report.json` berisi `session_id` + `cost_usd`
 - [ ] pyright clean: `pyright router/ csmart.py`
+
+## Wave 3 — QG Verification (2026-08-28)
+- pytest: 83 passed, 0 failed (hermetic, `-m "not live"`) — **84 after Wave-3 fix loop** (+1 regression test)
+- QG-01 [PASS] — test_jsonl_file_exists_and_parseable, test_event_and_custom_fields_roundtrip, test_trace_id_propagation, test_redaction_sensitive_keys, test_redaction_x_api_key_and_token, test_redact_method
+- QG-02 [PASS] — test_routing_runs_once_per_session
+- QG-03 [PASS] — test_exploration_tool_use_intercepted_and_resubmitted, test_shadow_rounds_bounded_at_three, test_traversal_relative_rejected, test_traversal_absolute_rejected, test_view_reads_file, test_grep_returns_hits, test_glob_finds_nested_py
+- QG-04 [PASS] — test_text_deltas_streamed_to_client, test_non_exploration_tool_use_passed_through
+- Completed Features: F-01..F-06, F-09, S-4, S-5, N-1..N-4, R-1, P-1..P-3, T-3
+
+## Wave 0-3 — Execution Log (2026-08-27/28)
+
+| Wave | Scope | Verdict | Commit |
+|------|-------|---------|--------|
+| 0 | git init + remote `noorbagus/hemat-token-router` (private) + baseline; freeze `CONTRACTS.md`; `router/safe_path.py` + tests | ✅ | `687901e` (baseline, lint fixes) |
+| 1 | Fase 0 entrypoint/config (A), proxy path safety (C), logger (D), tool_shadow (E) — 4 parallel builders | ✅ 83→84 tests | `687901e` (A) · `ff1310e` (C) · `af3a0a6` (D) · `cd95973` (E) |
+| 2 | dispatcher.py rewrite: FastAPI proxy engine, SSE shadow loop, routing cache, cli_dispatch split | ✅ 83 tests, pyright 0 | `3c07b27` · `cf79c12` |
+| 3 | reviewer → tester∥linter → changelog → **fix loop** (1 BLOCKER + 7 MAJOR + 2 MINOR) → final commit | ✅ 84 tests, pyright 0 | `b48d2c9` (review fixes) · `a1f3c5e` (release) |
+
+**Wave-3 review fix loop (all findings verified against code before fixing):**
+- **BLOCKER** — CLI Step 4 raw-read `gate_result.selected_files` (Ollama-chosen) and forwarded to dispatch_claude → exfiltration to upstream gateway. Fixed: every path validated via `resolve_under_base(file, context_dir)`; traversal/missing skipped; regression test `test_main_cli_skips_path_traversal_selected_files` added.
+- **MAJOR** — budget passed as bytes-as-tokens (`* 4` → 4× too lenient) in both csmart.py and dispatcher.py → now passes tokens directly to `apply_gate`.
+- **MAJOR** — `base_dir` never threaded → gate + `inject_context_to_messages` now resolve relative to `context_dir`.
+- **MAJOR** — `_run_glob` absolute patterns raise `NotImplementedError` on Py3.11+ → rejected with ERROR string + added to except tuple.
+- **MAJOR** — `_ROUTING_CACHE` unbounded → `OrderedDict` LRU capped at 128 under existing lock.
+- **MAJOR** — mid-stream `httpx.TransportError` escaped → truncated client stream → caught, graceful SSE error, `_round_failed` flag.
+- **MAJOR** — global `trace_id` race → `trace_id` threaded through `run_local_routing` + INBOUND_REQUEST/AST_SCANNED/OLLAMA_TRIAGE logs.
+- **MINOR** — `os.makedirs(dirname(report_path))` crashed on dir-less `--report-path` → guarded both spots.
+- **MINOR** — SSE_STREAM_COMPLETE logged `status="ok"` even after round error → `status="error"` when `_round_failed`.
+- **Deferred (documented, non-blocking):** list-content injection in `inject_context_to_messages`, redaction depth (fields overwrite trace_id if passed), held-input reassembly seed, `round_had_held` dead var.
+
+**Final state:** `pytest tests/ -q` = 84 passed · `pyright router/ csmart.py` = 0 errors · `csmart --dry-run` report `status: ok`, gate `pass`.
