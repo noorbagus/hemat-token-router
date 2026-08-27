@@ -4,18 +4,198 @@
 Modes:
 1. CLI mode (original): `csmart "your prompt"` - direct Claude Code CLI dispatch with pre-routed context
 2. Proxy mode: `csmart start` - run local reverse proxy on port 4000 for Anthropic API with context injection
+3. Health check: `csmart status` - report Ollama and upstream gateway health
 
 Token-optimized: reduces token usage by 60-90% for large codebases.
 """
 
 import argparse
 import asyncio
-import sys
+import json
 import os
+import sys
 
 import uvicorn
 
 from router.proxy import app, check_ollama_health, check_upstream_health
+
+
+# Known proxy subcommands (Track A: entrypoint + config)
+KNOWN_COMMANDS = ("start", "status")
+
+# Default configuration constants (kept at module scope so build_parser() is
+# usable from tests without re-executing the CLI flow).
+DEFAULT_CONFIDENCE_THRESHOLD = 0.65
+DEFAULT_BUDGET_TOKENS = 16000  # ~64KB at 4 bytes/token
+DEFAULT_REPORT_PATH = ".csmart/last-report.json"
+DEFAULT_TIMEOUT = 600  # 10 minutes max for Claude dispatch
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 4000
+
+
+class CSmartParser(argparse.ArgumentParser):
+    """ArgumentParser that routes ``start``/``status`` to subparsers while letting
+    any other first positional flow through as a CLI-mode prompt.
+
+    argparse's subparsers action greedily treats the first positional as a
+    subcommand, so a bare prompt such as ``csmart "hello"`` would otherwise be
+    rejected as an unknown command. This parser pre-scans argv, forwards known
+    commands to the native subparsers, and dispatches any other first positional
+    to a dedicated CLI-only parser (set as ``_cli_parser`` by ``build_parser``).
+    """
+
+    def parse_args(self, args=None, namespace=None):
+        argv = list(args) if args is not None else sys.argv[1:]
+        first = self._first_positional(argv)
+        if first in KNOWN_COMMANDS:
+            # Known subcommand -> let argparse's subparsers handle it.
+            return super().parse_args(argv, namespace)
+        cli_parser = getattr(self, "_cli_parser", None)
+        if first is not None and cli_parser is not None:
+            # Anything else is a CLI-mode prompt.
+            return cli_parser.parse_args(argv, namespace)
+        # No positional (help, empty, or flags-only) -> native parsing.
+        return super().parse_args(argv, namespace)
+
+    def _first_positional(self, argv):
+        """Return the first positional token in ``argv``, skipping flags and the
+        value token of flags that consume one. Returns ``None`` when absent."""
+        i, n = 0, len(argv)
+        while i < n:
+            tok = argv[i]
+            if tok == "--":
+                return argv[i + 1] if i + 1 < n else None
+            if tok.startswith("-") and tok != "-":
+                i += 1
+                if "=" not in tok and self._takes_value(tok):
+                    i += 1
+                continue
+            return tok
+        return None
+
+    def _takes_value(self, option):
+        action = self._option_string_actions.get(option)
+        if action is None:
+            return False
+        # store_true / store_false / count / help use nargs == 0 (no value).
+        return action.nargs != 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser.
+
+    Shared flags live on a single parent parser (``add_help=False``) that is
+    inherited by the main parser, each subparser, and the internal CLI-only
+    parser, so ``--json``/``--strict``/``--threshold``/... work identically in
+    every mode.
+    """
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument(
+        "--json",
+        action="store_true",
+        help="Print full JSON report to stdout after completion (CLI mode)",
+    )
+    shared.add_argument(
+        "--strict",
+        action="store_true",
+        help="Abort execution if confidence is below threshold (fail-closed)",
+    )
+    shared.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_CONFIDENCE_THRESHOLD,
+        help=f"Confidence threshold for routing (default: {DEFAULT_CONFIDENCE_THRESHOLD})",
+    )
+    shared.add_argument(
+        "--budget",
+        type=int,
+        default=DEFAULT_BUDGET_TOKENS,
+        help=f"Maximum token budget for injected context (default: {DEFAULT_BUDGET_TOKENS})",
+    )
+    shared.add_argument(
+        "--report-path",
+        type=str,
+        default=DEFAULT_REPORT_PATH,
+        help=f"Path to write JSON report (default: {DEFAULT_REPORT_PATH})",
+    )
+    shared.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT,
+        help=f"Timeout in seconds for Claude CLI (default: {DEFAULT_TIMEOUT})",
+    )
+    shared.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compose everything but don't dispatch to Claude (for testing)",
+    )
+    shared.add_argument(
+        "--context-dir",
+        type=str,
+        default=".",
+        help="Root directory to scan for context (default: current directory)",
+    )
+
+    parser = CSmartParser(
+        prog="csmart",
+        description=(
+            "csmart - Claude Smart Local Routing\n\n"
+            'CLI mode:  csmart "your coding task prompt" [options]\n'
+            "Proxy:     csmart start [--host X] [--port Y]\n"
+            "Health:    csmart status"
+        ),
+        parents=[shared],
+    )
+    parser.add_argument(
+        "prompt",
+        nargs="?",
+        default=None,
+        help="The coding task prompt to execute (CLI mode only)",
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command",
+        title="commands",
+        metavar="{start,status}",
+    )
+
+    start_p = subparsers.add_parser(
+        "start",
+        parents=[shared],
+        help="Run the local reverse proxy server",
+    )
+    start_p.add_argument(
+        "--host",
+        type=str,
+        default=DEFAULT_HOST,
+        help=f"Host to bind proxy server (default: {DEFAULT_HOST})",
+    )
+    start_p.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"Port to bind proxy server (default: {DEFAULT_PORT})",
+    )
+
+    subparsers.add_parser(
+        "status",
+        parents=[shared],
+        help="Check health of Ollama and upstream gateway",
+    )
+
+    # Dedicated CLI-mode parser (not a subparser) so `csmart "prompt"` keeps
+    # working alongside the subcommand dispatch above.
+    cli_parser = argparse.ArgumentParser(add_help=False, parents=[shared])
+    cli_parser.add_argument(
+        "prompt",
+        nargs="?",
+        default=None,
+        help="The coding task prompt to execute (CLI mode only)",
+    )
+    cli_parser.set_defaults(command=None)
+    parser._cli_parser = cli_parser
+
+    return parser
 
 
 def cmd_status() -> None:
@@ -24,8 +204,8 @@ def cmd_status() -> None:
     upstream_ok = asyncio.run(check_upstream_health())
 
     print("csmart health check:")
-    print(f"  Ollama (qwen2.5-coder:7b): {'✓ OK' if ollama_ok else '❌ NOT reachable/model not found"}
-    print(f"  Upstream gateway: {'✓ OK' if upstream_ok else '❌ NOT reachable"}
+    print(f"  Ollama (qwen2.5-coder:7b): {'✓ OK' if ollama_ok else '❌ NOT reachable/model not found'}")
+    print(f"  Upstream gateway: {'✓ OK' if upstream_ok else '❌ NOT reachable'}")
 
     if ollama_ok and upstream_ok:
         sys.exit(0)
@@ -33,7 +213,7 @@ def cmd_status() -> None:
         sys.exit(1)
 
 
-def cmd_start(host: str = "127.0.0.1", port: int = 4000) -> None:
+def cmd_start(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
     """Start the local reverse proxy server."""
     print(f"csmart starting reverse proxy on {host}:{port}")
     print(f"  Upstream: {os.environ.get('ANTHROPIC_UPSTREAM_URL', 'https://ark.talaga.my.id')}")
@@ -42,8 +222,12 @@ def cmd_start(host: str = "127.0.0.1", port: int = 4000) -> None:
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
-def main_cli() -> None:
-    """Original CLI mode - direct dispatch to Claude Code."""
+def main_cli(argv: list[str] | None = None) -> None:
+    """Entry point.
+
+    Original CLI mode: direct dispatch to Claude Code with pre-routed context.
+    Subcommands: ``start`` (proxy server) and ``status`` (health check).
+    """
     import time
     from typing import Optional
     from router.ast_extractor import scan_project_codebase
@@ -58,91 +242,14 @@ def main_cli() -> None:
         "venv", ".venv", ".dart_tool", "coverage", ".turbo", ".cache",
         "__pycache__", ".pytest_cache",
     }
-    DEFAULT_CONFIDENCE_THRESHOLD = 0.65
-    DEFAULT_BUDGET_TOKENS = 16000  # ~64KB at 4 bytes/token
-    DEFAULT_REPORT_PATH = ".csmart/last-report.json"
-    DEFAULT_TIMEOUT = 600  # 10 minutes max for Claude dispatch
 
-    parser = argparse.ArgumentParser(
-        description="csmart - Claude Smart Local Routing"
-    )
-    parser.add_argument(
-        "prompt",
-        help="The coding task prompt to execute (CLI mode only)",
-        nargs="?",
-        default=None,
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Print full JSON report to stdout after completion (CLI mode)",
-    )
-    parser.add_argument(
-        "--strict",
-        action="store_true",
-        help="Abort execution if confidence is below threshold (fail-closed)",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=DEFAULT_CONFIDENCE_THRESHOLD,
-        help=f"Confidence threshold for routing (default: {DEFAULT_CONFIDENCE_THRESHOLD})",
-    )
-    parser.add_argument(
-        "--budget",
-        type=int,
-        default=DEFAULT_BUDGET_TOKENS,
-        help=f"Maximum token budget for injected context (default: {DEFAULT_BUDGET_TOKENS})",
-    )
-    parser.add_argument(
-        "--report-path",
-        type=str,
-        default=DEFAULT_REPORT_PATH,
-        help=f"Path to write JSON report (default: {DEFAULT_REPORT_PATH})",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=DEFAULT_TIMEOUT,
-        help=f"Timeout in seconds for Claude CLI (default: {DEFAULT_TIMEOUT})",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Compose everything but don't dispatch to Claude (for testing)",
-    )
-    parser.add_argument(
-        "--context-dir",
-        type=str,
-        default=".",
-        help="Root directory to scan for context (default: current directory)",
-    )
-    parser.add_argument(
-        "--host",
-        type=str,
-        default="127.0.0.1",
-        help="Host to bind proxy server (default: 127.0.0.1)",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=4000,
-        help="Port to bind proxy server (default: 4000)",
-    )
-    parser.add_argument(
-        "command",
-        nargs="?",
-        choices=["start", "status"],
-        help="Command: 'start' = run proxy server, 'status' = health check",
-        default=None,
-    )
-
-    args = parser.parse_args()
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     # Handle proxy mode commands
     if args.command == "status":
         cmd_status()
-        return  # cmd_status exits itself
+        return  # cmd_status exits itself; this return is for testability
 
     if args.command == "start":
         cmd_start(args.host, args.port)
@@ -234,7 +341,6 @@ def main_cli() -> None:
         status = "ok" if dispatch_result.exit_code == 0 else "dispatch_error"
     else:
         # Dry run - create a dry dispatch result
-        from router.dispatcher import DispatchResult
         dispatch_result = DispatchResult(
             exit_code=0,
             duration_ms=0,
@@ -266,7 +372,6 @@ def main_cli() -> None:
     if args.json:
         print()
         print("=" * 50 + " VERIFICATION REPORT (JSON) " + "=" * 50)
-        import json
         print(json.dumps(report.model_dump(), indent=2))
 
     # Exit with appropriate code

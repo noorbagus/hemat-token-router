@@ -8,7 +8,7 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
   "tree-sitter>=0.26.0",
-  "tree-sitter-language-pack>=0.7.0",
+  "tree-sitter-language-pack>=1.15.8,<2",
   "ollama>=0.6.2",
   "pydantic>=2.0.0",
   "python-dotenv>=1.0.0",
@@ -18,4 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-csmart = "csmart:main"
+csmart = "csmart:main_cli"
+
+[dependency-groups]
+dev = ["pytest>=9.0"]
