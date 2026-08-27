@@ -482,6 +482,43 @@ Runbook:
 
 **Pre-flight check**: `csmart status` (Ollama reachable + model ter-pull + upstream reachable) sebelum sesi panjang.
 
+### 13.1 Dev Environment: RTK & DRIP Interference Handling (READ/WRITE)
+
+> Lingkungan dev ini menjalankan dua hook token-optimizer yang **mengintercept layer akses file**: **RTK** (rewrite command di Bash tool) dan **DRIP** (substitusi hasil `Read`). Transparan pada kondisi normal, tapi punya mode *failure* spesifik. Setiap AI agent (Claude Code, Cursor, subagent orchestrasi) yang mengerjakan repo ini **WAJIB** mengikuti tabel handling berikut — diverifikasi dengan evidence nyata Wave 4–5 (2026-08-28).
+
+**RTK — command-layer (shell):**
+
+| Gejala | Penyebab | Handling |
+|---|---|---|
+| Test gagal `ModuleNotFoundError: urllib3` | `pytest` bare resolve ke Python 3.9, bukan interpreter project | Selalu `rtk proxy python3.14 -m pytest ...` — python3.14 = interpreter dengan semua deps |
+| Output `grep`/`cat` tersummarisasi (`N matches in M files`, `[+N more]`) | Hook RTK meringkas output shell | Konten pasti → tool `Read`; raw → `rtk proxy <cmd>` (bypass filter) |
+| `python3.14 -m pyright` → `No module named pyright` | pyright bukan module Python 3.14 | Pakai binary standalone `pyright` (node-based), jangan `-m` |
+| `rtk gain` gagal | Name collision `reachingforthejack/rtk` | Verifikasi `which rtk`; fallback `rtk proxy` |
+
+**DRIP — read-layer:**
+
+| Gejala | Penyebab | Handling |
+|---|---|---|
+| `Read` → `[DRIP: unchanged since last read]` 0 byte, TANPA konten | Baseline di-set subagent/sesi lain, bukan context Anda | `drip refresh <path>` (satu file per call) → `Read` ulang |
+| `Read` setelah `Edit` sendiri → `[DRIP: edit verified \| ...]` | PostToolUse:Edit DRIP | Percaya cert (touched ranges + hash); `drip refresh` untuk konten penuh |
+| Re-read file berubah → unified diff (`--- old / +++ new`) | Delta-only read | Apply hunk secara mental; JANGAN re-read file utuh |
+| Header `↔ unchanged` / `↕ changed: +N -M` (cross-session) | Cross-session registry | Header jujur; konten terkirim = current |
+| `Edit` gagal "must Read before editing" | DRIP-substituted first-read skip native Read → read-before-edit tracker belum terisi | `drip refresh` → `Read` native → baru `Edit` |
+| `[DRIP: full read \| ↺ compacted]` | Setelah `/compact`/`/clear`/`--resume` | Normal; baseline reset, read berikutnya delta/unchanged |
+| `DRIP_COMPRESS_FIRST_READ_MIN_BYTES` (opt-in) | Kompresi big first read | Trade-off: first read terkompresi + tracker Edit TIDAK terisi |
+
+> ⚠️ **Penting**: `<error>` wrapper berisi header DRIP = **SUKSES** (transport `permissionDecision: deny`), bukan error. Jangan re-request file yang sudah di-substitusi.
+
+**WRITE-layer & multi-agent (SDLC):**
+
+| Aturan | Keterangan |
+|---|---|
+| **Sole git writer** | Orchestrator SATU-SATUNYA yang `git commit/push`. Subagent JANGAN commit (dilanggar Track A Wave 5 — commit dipertahankan, rule diperkuat ke seluruh builder). |
+| **Staging eksplisit** | Parallel builder menulis file berbeda di working tree yang sama → `git status` mencampur ownership. `git add <path...>` per-wave, JANGAN `git add -A`. |
+| **DRIP baseline antar-sesi** | `Read` subagent mencatat baseline di context subagent, bukan orchestrator → orchestrator re-read tampak "unchanged 0 byte". Recovery wajib: `drip refresh`. |
+| **Edit tool = path WRITE kode** | Jangan `echo`/`tee` di shell untuk tulis kode (lewat RTK rewrite tak perlu). Pakai `Edit`/`Write` tool saja. |
+| **Out-of-band write** | `git pull` / edit manual → `drip refresh` dulu agar baseline sinkron, baru `Read`. |
+
 ---
 
 ## 14. Risiko & Mitigasi
@@ -496,6 +533,7 @@ Runbook:
 | **Token/credential bocor ke log** | Eksposur secret | Redaksi wajib di logger; test redaksi |
 | **Path traversal** via tool shadow | Arbitrary file read | Validasi `resolve().is_relative_to(root)` |
 | **Entrypoint rusak** (baseline P0) | Tool tak bisa dijalankan | Fix di Fase 0 (lihat roadmap `CODEBASE_ANALYSIS.md`) |
+| **RTK/DRIP interferensi** | READ ter-substitusi 0 byte / shell salah Python / git staging campur ownership | Protokol §13.1: `drip refresh` + `rtk proxy python3.14` + staging eksplisit per-wave |
 
 ---
 
