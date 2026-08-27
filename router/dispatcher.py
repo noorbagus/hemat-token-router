@@ -26,6 +26,7 @@ import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from uuid import uuid4
 
@@ -88,8 +89,11 @@ _UPSTREAM_TRANSPORT: Optional[httpx.AsyncBaseTransport] = None
 
 _AST_CACHE: Dict[str, List[str]] = {}
 _AST_CACHE_LOCK = threading.Lock()
-_ROUTING_CACHE: Dict[str, RoutingResult] = {}
+_ROUTING_CACHE: OrderedDict[str, RoutingResult] = OrderedDict()
 _ROUTING_CACHE_LOCK = threading.Lock()
+# LRU cap (P-1 review MAJOR): past sessions are cheap to re-route via Ollama,
+# so the cache never grows unbounded.
+_MAX_ROUTING_CACHE_ENTRIES = 128
 
 
 class UpstreamError(Exception):
@@ -156,14 +160,15 @@ def extract_last_user_prompt(messages: List[Dict[str, Any]]) -> str:
 def inject_context_to_messages(
     messages: List[Dict[str, Any]],
     selected_files: List[str],
+    base_dir: str = ".",
 ) -> List[Dict[str, Any]]:
     """Inject pre-loaded file context into the last user message.
 
     Path-safety (F-09): every path in ``selected_files`` is validated through
     :func:`router.safe_path.resolve_under_base` before being read. Paths that
     escape the base dir (``..``, absolute-outside, symlink-outside) or that do
-    not exist are skipped with a warning; only files resolving inside ``.``
-    (CWD) are read.
+    not exist are skipped with a warning; only files resolving inside
+    *base_dir* are read.
     """
     if not selected_files:
         return messages
@@ -171,7 +176,7 @@ def inject_context_to_messages(
     context_blocks: List[str] = []
     for file_path in selected_files:
         try:
-            resolved = resolve_under_base(file_path, ".")
+            resolved = resolve_under_base(file_path, base_dir)
         except PathTraversalError:
             _stdlib_logger.warning(
                 "skipping path traversal attempt in selected file: %r", file_path
@@ -234,6 +239,7 @@ async def run_local_routing(
     prompt: str,
     session_key: str | None = None,
     context_dir: str = ".",
+    trace_id: str | None = None,
 ) -> GateResult:
     """Run local routing: AST scan (cached) -> Ollama scoring -> gate.
 
@@ -246,6 +252,7 @@ async def run_local_routing(
     skeletons = await _get_or_scan_ast(context_dir)
     logger.log(
         AST_SCANNED,
+        trace_id=trace_id,
         context_dir=context_dir,
         scanned_files_count=len(skeletons),
     )
@@ -255,24 +262,35 @@ async def run_local_routing(
     if session_key:
         with _ROUTING_CACHE_LOCK:
             routing = _ROUTING_CACHE.get(session_key)
+            if routing is not None:
+                _ROUTING_CACHE.move_to_end(session_key)  # LRU recency bump
         if routing is None:
             routing = await asyncio.to_thread(
                 ollama_scorer.route_target_files, full_skeleton, prompt
             )
             with _ROUTING_CACHE_LOCK:
                 _ROUTING_CACHE[session_key] = routing
+                _ROUTING_CACHE.move_to_end(session_key)
+                if len(_ROUTING_CACHE) > _MAX_ROUTING_CACHE_ENTRIES:
+                    _ROUTING_CACHE.popitem(last=False)  # evict oldest
     else:
         routing = await asyncio.to_thread(
             ollama_scorer.route_target_files, full_skeleton, prompt
         )
     routing_ms = int((time.monotonic() - t0) * 1000)
 
-    budget_bytes = DEFAULT_BUDGET_TOKENS * 4
+    # apply_gate takes tokens (it converts to bytes internally); the old `* 4`
+    # passed bytes-as-tokens, making the budget 4x too lenient (review MAJOR).
     gate_result = await asyncio.to_thread(
-        apply_gate, routing, CONFIDENCE_THRESHOLD, budget_bytes
+        apply_gate,
+        routing,
+        CONFIDENCE_THRESHOLD,
+        DEFAULT_BUDGET_TOKENS,
+        base_dir=context_dir,
     )
     logger.log(
         OLLAMA_TRIAGE,
+        trace_id=trace_id,
         session=session_key,
         selected_files=gate_result.selected_files,
         confidence=routing.confidence,
@@ -397,6 +415,7 @@ class _ShadowStreamer:
         self.shadow_used = 0
         self.client_index = 0
         self._pending_held: List[Dict[str, Any]] = []
+        self._round_failed = False
         self._start_ts = time.monotonic()
 
     # -- public driver -------------------------------------------------
@@ -422,6 +441,7 @@ class _ShadowStreamer:
                 duration_ms=self._elapsed_ms(),
                 rounds=self.round,
                 shadow_used=self.shadow_used,
+                status="error" if self._round_failed else "ok",
             )
         except UpstreamError as exc:
             payload = {
@@ -446,6 +466,7 @@ class _ShadowStreamer:
                 self.method, self.url, self.headers, {**self.body, "messages": messages}
             )
         except UpstreamError as exc:
+            self._round_failed = True
             payload = {
                 "type": "error",
                 "error": {"type": "api_error", "message": str(exc)},
@@ -454,6 +475,7 @@ class _ShadowStreamer:
             return
 
         if resp.status_code >= 400:
+            self._round_failed = True
             body_text = (await resp.aread()).decode("utf-8", errors="replace")
             await resp.aclose()
             await client.aclose()
@@ -567,11 +589,26 @@ class _ShadowStreamer:
 
                 if etype == "error":
                     # Upstream sent an SSE error; forward and stop the round.
+                    self._round_failed = True
                     yield self._format_event(event_name, payload)
                     return
 
                 # Unknown event type: forward untouched.
                 yield self._format_event(event_name, payload)
+        except httpx.TransportError as exc:
+            # Mid-stream transport failure (connection reset, read error): emit
+            # a graceful SSE error instead of a truncated client stream (P-3
+            # review MAJOR). Marked failed so run() logs status="error".
+            self._round_failed = True
+            payload = {
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": f"stream interrupted: {exc}",
+                },
+            }
+            yield self._format_event("error", payload)
+            return
         finally:
             await resp.aclose()
             await client.aclose()
@@ -705,6 +742,7 @@ async def handle_messages_request(request: Request) -> Response:
     session_key = request.headers.get("x-csmart-session")
     logger.log(
         INBOUND_REQUEST,
+        trace_id=trace_id,
         path=request.url.path,
         session=session_key,
         prompt_len=len(prompt),
@@ -712,10 +750,15 @@ async def handle_messages_request(request: Request) -> Response:
 
     context_dir = _context_dir()
     gate_result = await run_local_routing(
-        prompt, session_key=session_key, context_dir=context_dir
+        prompt,
+        session_key=session_key,
+        context_dir=context_dir,
+        trace_id=trace_id,
     )
 
-    modified_messages = inject_context_to_messages(messages, gate_result.selected_files)
+    modified_messages = inject_context_to_messages(
+        messages, gate_result.selected_files, base_dir=context_dir
+    )
     body["messages"] = modified_messages
 
     return await forward_streaming_request(

@@ -128,7 +128,8 @@ def _sse_n_tool_uses(count: int) -> str:
 def _hermetic(monkeypatch):
     """Clear caches + patch routing to hermetic fixtures for every test."""
     monkeypatch.setattr(dispatcher, "_AST_CACHE", {})
-    monkeypatch.setattr(dispatcher, "_ROUTING_CACHE", {})
+    # Reset to a fresh instance of the module's cache type (OrderedDict LRU).
+    monkeypatch.setattr(dispatcher, "_ROUTING_CACHE", type(dispatcher._ROUTING_CACHE)())
     monkeypatch.setattr(
         "router.ast_extractor.scan_project_codebase",
         lambda root_dir, ignore_dirs: ["// mock.py\n- def mock()\n"],

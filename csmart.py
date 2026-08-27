@@ -243,6 +243,7 @@ def main_cli(argv: list[str] | None = None) -> None:
     from router.ast_extractor import scan_project_codebase
     from router.ollama_scorer import route_target_files
     from router.gate import apply_gate
+    from router.safe_path import PathTraversalError, resolve_under_base
     from router.cli_dispatch import dispatch_claude, DispatchResult
     from router.report import GatewayConfig, create_report, write_report
 
@@ -285,9 +286,12 @@ def main_cli(argv: list[str] | None = None) -> None:
     routing_result = route_target_files(full_skeleton, args.prompt)
     t_routing = int((time.time() - t1) * 1000)
 
-    # Step 3: Apply confidence gate and budget cap
-    budget_bytes = args.budget * 4  # 4 bytes ≈ 1 token
-    gate_result = apply_gate(routing_result, args.threshold, budget_bytes)
+    # Step 3: Apply confidence gate and budget cap.
+    # apply_gate takes *tokens* (it converts to bytes internally); the old
+    # `* 4` passed bytes-as-tokens, making the budget 4x too lenient.
+    gate_result = apply_gate(
+        routing_result, args.threshold, args.budget, base_dir=args.context_dir
+    )
 
     # Check if we should abort in --strict mode
     if args.strict and gate_result.status == "blocked":
@@ -311,8 +315,9 @@ def main_cli(argv: list[str] | None = None) -> None:
             status=status,
         )
         report_path = args.report_path
-        if not os.path.exists(os.path.dirname(report_path)):
-            os.makedirs(os.path.dirname(report_path), exist_ok=True)
+        report_dir = os.path.dirname(report_path)
+        if report_dir and not os.path.exists(report_dir):
+            os.makedirs(report_dir, exist_ok=True)
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(report.model_dump(), f, indent=2)
         if args.json:
@@ -321,16 +326,33 @@ def main_cli(argv: list[str] | None = None) -> None:
             print(json.dumps(report.model_dump(), indent=2))
         sys.exit(2)
 
-    # Step 4: Get selected files exist and calculate injected bytes
+    # Step 4: Validate selected files are inside context_dir and read them.
+    # Path-safety (review BLOCKER): paths are Ollama-chosen, so every one is
+    # checked through resolve_under_base before touching the filesystem; a
+    # traversal attempt (.., absolute-outside, symlink-outside) is skipped
+    # rather than read, so an adversarial routing result cannot exfiltrate
+    # files outside the project (CONTRACTS.md §6).
     selected_files = gate_result.selected_files
     injected_bytes = 0
     existing_files: list[str] = []
     for file_path in selected_files:
-        if os.path.exists(file_path):
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-                injected_bytes += len(content.encode("utf-8"))
-                existing_files.append(file_path)
+        try:
+            resolved = resolve_under_base(file_path, args.context_dir)
+        except PathTraversalError:
+            print(
+                f"csmart: skipping selected path outside context dir: {file_path}",
+                file=sys.stderr,
+            )
+            continue
+        if not resolved.is_file():
+            print(
+                f"csmart: skipping missing selected file: {file_path}",
+                file=sys.stderr,
+            )
+            continue
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+        injected_bytes += len(content.encode("utf-8"))
+        existing_files.append(str(resolved))
 
     # Step 5: Dispatch to Claude Code CLI
     gateway_config = GatewayConfig(
@@ -348,6 +370,7 @@ def main_cli(argv: list[str] | None = None) -> None:
             prompt=args.prompt,
             gate_info=gate_result,
             dry_run=False,
+            timeout=args.timeout,
         )
         assert dispatch_result is not None  # dispatch_claude always returns a result
         status = "ok" if dispatch_result.exit_code == 0 else "dispatch_error"
@@ -376,8 +399,9 @@ def main_cli(argv: list[str] | None = None) -> None:
         status=status,
     )
     report_path = args.report_path
-    if not os.path.exists(os.path.dirname(report_path)):
-        os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    report_dir = os.path.dirname(report_path)
+    if report_dir and not os.path.exists(report_dir):
+        os.makedirs(report_dir, exist_ok=True)
     write_report(report, report_path)
 
     # Print report to stdout if --json is requested

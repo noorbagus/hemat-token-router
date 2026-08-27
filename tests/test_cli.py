@@ -8,7 +8,12 @@ needed, and ``build_parser()`` only builds an argument parser.
 import pytest
 
 import csmart
+import router.ast_extractor
+import router.cli_dispatch
+import router.ollama_scorer
 from csmart import build_parser
+from router.cli_dispatch import DispatchResult
+from router.ollama_scorer import RoutingResult
 
 
 def test_parse_start_sets_command() -> None:
@@ -111,3 +116,68 @@ def test_main_cli_start_calls_cmd_start(monkeypatch) -> None:
     result = csmart.main_cli(["start"])
     assert result is None
     assert captured == {"host": "127.0.0.1", "port": 4000}
+
+
+def test_main_cli_skips_path_traversal_selected_files(monkeypatch, tmp_path) -> None:
+    """Ollama-chosen paths outside context_dir are skipped, never read/dispatched.
+
+    Regression for the Wave-3 review BLOCKER: Step 4 used to raw-``open()``
+    whatever ``gate_result.selected_files`` contained, so an adversarial routing
+    result pointing at ``../secret`` (or an absolute path outside) was read and
+    forwarded to dispatch_claude — and from there to the upstream gateway. Now
+    every path is validated through ``resolve_under_base`` first (CONTRACTS.md §6).
+    """
+    ctx = tmp_path / "project"
+    ctx.mkdir()
+    ok_file = ctx / "src" / "ok.py"
+    ok_file.parent.mkdir()
+    ok_file.write_text("def ok():\n    pass\n")
+
+    # Outside the context dir: one relative ``../`` escape, one absolute path.
+    secret = tmp_path / "secret.py"
+    secret.write_text("SECRET=1")
+
+    def fake_scan(root_dir, ignore_dirs):
+        return ["// ok.py\n- def ok()\n"]
+
+    def fake_route(skeleton, prompt):
+        return RoutingResult(
+            target_files=["../secret.py", str(secret), "src/ok.py"],
+            confidence=1.0,
+            reasoning="regression",
+        )
+
+    dispatched: list[str] = []
+
+    def fake_dispatch(files, prompt, gate_info, dry_run=False, timeout=600.0):
+        dispatched.extend(files)
+        return DispatchResult(
+            exit_code=0,
+            duration_ms=1,
+            cost_usd=None,
+            session_id=None,
+            result_excerpt="ok",
+            dry_run=False,
+        )
+
+    monkeypatch.setattr(router.ast_extractor, "scan_project_codebase", fake_scan)
+    monkeypatch.setattr(router.ollama_scorer, "route_target_files", fake_route)
+    monkeypatch.setattr(router.cli_dispatch, "dispatch_claude", fake_dispatch)
+
+    report = tmp_path / "report.json"
+    with pytest.raises(SystemExit):
+        csmart.main_cli(
+            [
+                "--context-dir",
+                str(ctx),
+                "--report-path",
+                str(report),
+                "fix the bug",
+            ]
+        )
+
+    assert report.exists()
+    # Only the in-context file reached dispatch_claude (resolved absolute path).
+    assert dispatched == [str(ok_file.resolve())]
+    # The traversal candidates must never be read or forwarded.
+    assert not any("secret" in p for p in dispatched)

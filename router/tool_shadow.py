@@ -148,6 +148,10 @@ def _run_glob(tool_input: dict, base_dir: Path) -> str:
     pattern = str(pattern)
     if ".." in pattern:
         return "ERROR: glob pattern must not contain '..'"
+    # Absolute patterns raise NotImplementedError on Python 3.11+; reject them
+    # explicitly so a traversal attempt never surfaces as a 500 (review MAJOR).
+    if pattern.startswith("/"):
+        return "ERROR: glob pattern must be relative to the project root"
     subdir = str(tool_input.get("path") or tool_input.get("directory") or ".")
     resolved = _resolve_or_error(subdir, base_dir)
     if isinstance(resolved, str):
@@ -157,7 +161,7 @@ def _run_glob(tool_input: dict, base_dir: Path) -> str:
             matches = sorted(resolved.glob(pattern))
         else:
             matches = sorted(resolved.rglob(pattern))
-    except (OSError, re.error) as exc:
+    except (OSError, re.error, NotImplementedError) as exc:
         return f"ERROR: glob failed: {exc}"
     lines = []
     for match in matches:
