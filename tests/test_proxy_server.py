@@ -922,7 +922,7 @@ def test_run_local_routing_passes_capped_skeleton(monkeypatch):
 
 
 def test_routing_ttl_cache_reuses_across_burst(monkeypatch):
-    """P-0: session-less requests in one burst route via Ollama only once."""
+    """P-0: session-less requests with the SAME prompt route via Ollama once."""
     route_calls: List[str] = []
 
     def _counting_route(skeleton, prompt):
@@ -936,9 +936,37 @@ def test_routing_ttl_cache_reuses_across_burst(monkeypatch):
     )
 
     _run(dispatcher.run_local_routing("task one"))
-    _run(dispatcher.run_local_routing("task two"))
+    _run(dispatcher.run_local_routing("task one"))
 
     assert len(route_calls) == 1
+
+
+def test_routing_ttl_cache_prompt_differentiated(monkeypatch):
+    """FIX #2: the session-less TTL cache key includes the prompt, so a
+    different prompt on the same context_dir never reuses a stale triage, while
+    an identical prompt still hits the cache."""
+    route_calls: List[str] = []
+
+    def _counting_route(skeleton, prompt):
+        route_calls.append(prompt)
+        return RoutingResult(target_files=["a.py"], confidence=0.8, reasoning="ttl")
+
+    monkeypatch.setattr("router.ollama_scorer.route_target_files", _counting_route)
+    monkeypatch.setattr(
+        "router.ast_extractor.scan_project_codebase",
+        lambda root_dir, ignore_dirs: ["// a.py\n- def a()\n"],
+    )
+
+    # Same context_dir (default "."), different prompts -> no stale hit.
+    _run(dispatcher.run_local_routing("task one"))
+    _run(dispatcher.run_local_routing("task two"))
+
+    assert len(route_calls) == 2
+
+    # Same context_dir + same prompt -> TTL cache hit, no extra triage call.
+    _run(dispatcher.run_local_routing("task one"))
+
+    assert len(route_calls) == 2
 
 
 def test_routing_ttl_cache_expires_when_ttl_zero(monkeypatch):

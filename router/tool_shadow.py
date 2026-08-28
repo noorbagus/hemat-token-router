@@ -11,6 +11,9 @@ Exposes two async entrypoints:
   before touching the filesystem (anti path-traversal, QG-03 groundwork).
 * :func:`summarize_exploration` optionally condenses large raw tool output via
   Ollama (``qwen2.5-coder:7b`` by default), keeping short outputs untouched.
+  Reader-tool output (``View``, ``read_file``, ``FileRead``) is source code and
+  passes through verbatim instead of being summarized (see the function's
+  docstring).
 
 All filesystem work runs in a worker thread via ``asyncio.to_thread`` so the
 caller's event loop is never blocked.
@@ -280,16 +283,25 @@ def _extract_message_content(response: object) -> str | None:
 
 
 async def summarize_exploration(tool_name: str, raw_output: str) -> str:
-    """Summarize large exploration output via Ollama; short output passes through.
+    """Summarize large non-reader tool output via Ollama; short output passes through.
 
     Outputs of length ``<= SUMMARIZE_THRESHOLD`` (4000) are returned unchanged
     without calling Ollama. Longer outputs are summarized with model
-    ``OLLAMA_MODEL`` (default ``qwen2.5-coder:7b``). If Ollama is unavailable or
-    raises, a truncated copy of *raw_output* is returned -- this function never
-    raises.
+    ``OLLAMA_MODEL`` (default ``qwen2.5-coder:7b``) -- but only for non-reader
+    tools (``GlobTool``, ``GrepTool``, ``LS``). Reader-tool output (``View``,
+    ``read_file``, ``FileRead``) IS source code, so it is passed through
+    verbatim (bounded to :data:`MAX_OUTPUT_CHARS`) instead of summarized. If
+    Ollama is unavailable or raises, a truncated copy of *raw_output* is
+    returned -- this function never raises.
     """
     if len(raw_output) <= SUMMARIZE_THRESHOLD:
         return raw_output
+    if _normalize_tool_name(tool_name) in _READER_TOOLS:
+        # Reader output is source code: summarizing it can drop API signatures,
+        # and the model fills the gaps with plausible-but-fictional identifiers
+        # (e.g. `max_size`/`env_ttl_key` for the real `max_entries`/`ttl_seconds_provider`).
+        # Preserve the exact text up to the hard bound -- see docs/ab-test-request-count.md #2.
+        return _bounded(raw_output)
     try:
         model = os.environ.get("OLLAMA_MODEL", _DEFAULT_OLLAMA_MODEL)
         response = await asyncio.to_thread(

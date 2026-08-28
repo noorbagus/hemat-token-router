@@ -21,10 +21,12 @@ until the orchestrator repoints its imports.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -325,6 +327,192 @@ def inject_context_to_messages(
     return new_messages
 
 
+# Top-level import statement matcher (column-0 only, so function-local imports
+# are never considered). Covers the four shapes that matter for the FIX #3
+# import expansion: ``import X``, ``from X import ...``, ``from . import x``,
+# ``from .x import ...``. Multiline parenthesized from-imports are only
+# partially resolved (their first line); that is acceptable — the helper is a
+# safety net that appends modules triage missed, never a full dependency graph.
+_IMPORT_STMT_RE = re.compile(
+    r"^(?:import\s+(?P<imp>[^#\n]+?)"
+    r"|from\s+(?P<from_mod>[.\w]+)\s+import\s+(?P<names>[^#\n]+?))"
+    r"(?:\s*#.*)?\s*$",
+    re.MULTILINE,
+)
+
+
+def _module_candidates(mod: str, root_dir: str) -> List[str]:
+    """Map a dotted module name to absolute candidate paths (may not exist).
+
+    ``mod`` is resolved relative to ``root_dir`` — the repo root for absolute
+    imports, the current file's package directory for relative imports: ``a.b``
+    becomes ``<root>/a/b.py`` and, for package imports, ``<root>/a/b/__init__.py``.
+    Callers must validate existence and path-safety themselves.
+    """
+    base = os.path.abspath(root_dir)
+    rel = mod.replace(".", os.sep)
+    return [os.path.join(base, f"{rel}.py"), os.path.join(base, rel, "__init__.py")]
+
+
+def _split_import_names(names: str) -> List[str]:
+    """Split a ``from ... import <names>`` clause into module names.
+
+    Each comma-separated item keeps only its first token so ``x as y`` (and any
+    ``x`` with a whitespace alias) still resolves to module ``x``.
+    """
+    out: List[str] = []
+    for item in names.split(","):
+        token = item.strip().split()[0] if item.strip() else ""
+        if token and token != "*":
+            out.append(token)
+    return out
+
+
+def _import_candidates(
+    source: str, package_dir: str, base_dir: str
+) -> List[str]:
+    """Collect local module paths imported at the top level of *source*.
+
+    Absolute imports (``import X`` / ``from X import ...``) resolve against the
+    repository root ``base_dir`` (``a.b`` -> ``<base>/a/b.py``); relative
+    imports (``from . import x`` / ``from .x import ...``) resolve against the
+    current file's package directory ``package_dir``. Returns absolute
+    candidate paths (they may not exist on disk — callers filter via
+    :func:`router.safe_path.resolve_under_base`).
+    """
+    out: List[str] = []
+    for match in _IMPORT_STMT_RE.finditer(source):
+        if match.group("imp"):
+            # ``import X`` / ``import X, Y`` / ``import a.b as c``.
+            for item in _split_import_names(match.group("imp")):
+                out.extend(_module_candidates(item, base_dir))
+            continue
+        from_mod = match.group("from_mod")
+        if from_mod.startswith("."):
+            # Relative import: each leading dot walks one package level up from
+            # the current file's directory. ``from .x import y`` resolves
+            # against package_dir; ``from ..x import y`` against its parent.
+            dot_count = len(from_mod) - len(from_mod.lstrip("."))
+            base_for_rel = package_dir
+            for _ in range(dot_count - 1):
+                base_for_rel = os.path.dirname(base_for_rel)
+            rel = from_mod.lstrip(".")
+            if rel:
+                out.extend(_module_candidates(rel, base_for_rel))
+            else:
+                for name in _split_import_names(match.group("names")):
+                    out.extend(_module_candidates(name, base_for_rel))
+        else:
+            # ``from X import ...`` -> the module to load is ``X``.
+            out.extend(_module_candidates(from_mod, base_dir))
+    return out
+
+
+def _sum_selected_bytes(relpaths: List[str], base_dir: str = ".") -> int:
+    """Total on-disk bytes of *relpaths* under *base_dir*; missing files count 0.
+
+    Mirrors gate.py's size accounting (1 token ≈ 4 bytes) so budget re-caps and
+    report fields stay consistent. Symlink-aware like the rest of the pipeline:
+    the base is realpath-resolved so relative paths never leak ``../``.
+    """
+    base = os.path.realpath(base_dir)
+    total = 0
+    for rel in relpaths:
+        try:
+            resolved = resolve_under_base(rel, base)
+        except PathTraversalError:
+            continue
+        if resolved.is_file():
+            try:
+                total += resolved.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _expand_selected_with_imports(
+    selected_files: List[str],
+    base_dir: str = ".",
+    budget_tokens: int | None = None,
+) -> List[str]:
+    """Append top-level-imported local modules to the triage-selected files.
+
+    FIX #3 (A/B S2): triage selects only e.g. ``router/dispatcher.py`` and
+    misses ``router/routing_cache.py`` (imported at dispatcher.py module level),
+    so the model completes the task without knowing the imported file exists.
+    This helper scans each selected ``.py`` file for TOP-LEVEL imports
+    (``import X``, ``from X import ...``, ``from . import x``, ``from .x import
+    ...``), maps each module name to a local path under *base_dir* (dots →
+    slashes + ``.py``, also checking ``<pkg>/__init__.py``), validates it via
+    :func:`router.safe_path.resolve_under_base`, and appends existing,
+    non-duplicate paths. Order: selected files first, then discovered imports,
+    de-duplicated, first-seen order preserved. The path-safety contract of
+    :func:`inject_context_to_messages` is unchanged — it still validates every
+    path it receives.
+
+    ``budget_tokens`` re-caps the appended imports (gate.py convention: 1 token
+    ≈ 4 bytes) because FIX #3 runs AFTER ``apply_gate``: without the cap,
+    discovered imports could push the final injection over the budget the gate
+    already enforced on the selected files. When omitted (or <= 0) no cap is
+    applied. The base is realpath-resolved so ``os.path.relpath`` against
+    symlink-rooted base directories stays inside the repo (no ``../`` leaks,
+    matching ``_rel_to_base`` in tool_shadow.py).
+    """
+    base = os.path.realpath(base_dir)
+    ordered: List[str] = []
+    seen: set[str] = set()
+
+    for rel in selected_files:
+        if rel in seen:
+            continue
+        seen.add(rel)
+        ordered.append(rel)
+
+    budget_bytes: int | None = None
+    if budget_tokens is not None and budget_tokens > 0:
+        budget_bytes = budget_tokens * 4
+    total_bytes = (
+        _sum_selected_bytes(ordered, base_dir=base) if budget_bytes is not None else 0
+    )
+
+    for rel in selected_files:
+        try:
+            resolved = resolve_under_base(rel, base)
+        except PathTraversalError:
+            continue
+        if not resolved.is_file() or resolved.suffix != ".py":
+            continue
+        try:
+            with open(resolved, "r", encoding="utf-8", errors="replace") as f:
+                source = f.read()
+        except OSError:
+            continue
+        for cand in _import_candidates(source, str(resolved.parent), base):
+            try:
+                candidate = resolve_under_base(cand, base)
+            except PathTraversalError:
+                continue
+            if not candidate.is_file():
+                continue
+            # Express the discovered file as a repo-relative path (matching the
+            # triage-selected style), then append.
+            relpath = os.path.relpath(candidate, base).replace(os.sep, "/")
+            if relpath in seen:
+                continue
+            if budget_bytes is not None:
+                try:
+                    size = candidate.stat().st_size
+                except OSError:
+                    size = 0
+                if total_bytes + size > budget_bytes:
+                    continue  # import doesn't fit the token budget — drop it
+                total_bytes += size
+            seen.add(relpath)
+            ordered.append(relpath)
+
+    return ordered
+
+
 async def _get_or_scan_ast(context_dir: str) -> List[str]:
     """Scan the project once per context_dir (cached). Non-blocking (P-2)."""
     key = os.path.abspath(context_dir)
@@ -434,12 +622,19 @@ async def run_local_routing(
             )
             _ROUTING_CACHE.put(session_key, routing)
     else:
-        routing = _ROUTING_TTL_CACHE.get(context_dir)  # stale entries evicted
+        # FIX #2: key the session-less TTL cache by (context_dir, prompt) so a
+        # different prompt on the same repo never reuses a stale triage (A/B S2
+        # got a 0ms cache HIT with a wrong injection for the second prompt).
+        ttl_key = (
+            f"{context_dir}|"
+            f"{hashlib.sha1(prompt.encode('utf-8')).hexdigest()[:16]}"
+        )
+        routing = _ROUTING_TTL_CACHE.get(ttl_key)  # stale entries evicted
         if routing is None:
             routing = await asyncio.to_thread(
                 ollama_scorer.route_target_files, full_skeleton, prompt
             )
-            _ROUTING_TTL_CACHE.put(context_dir, routing)
+            _ROUTING_TTL_CACHE.put(ttl_key, routing)
         else:
             cache_hit = True
     routing_ms = int((time.monotonic() - t0) * 1000)
@@ -1106,8 +1301,28 @@ async def handle_messages_request(request: Request) -> Response:
         trace_id=trace_id,
     )
 
+    # FIX #3: triage can miss modules the selected files import at the top
+    # level (A/B S2: dispatcher.py imports routing_cache.py, yet only
+    # dispatcher.py was injected). Expand before injecting so the model sees
+    # the imported file exists; appended imports are capped at the same token
+    # budget apply_gate enforced (they run after it). inject's path-safety
+    # contract is unchanged.
+    selected_files = _expand_selected_with_imports(
+        gate_result.selected_files,
+        base_dir=context_dir,
+        budget_tokens=DEFAULT_BUDGET_TOKENS,
+    )
+    if selected_files != gate_result.selected_files:
+        # Keep the report's gate result describing what was actually injected
+        # (imports appended / dropped by the budget re-cap), not the pre-expansion
+        # set — otherwise selected_bytes / estimated_tokens would be stale.
+        gate_result.selected_files = selected_files
+        gate_result.selected_bytes = _sum_selected_bytes(
+            selected_files, base_dir=context_dir
+        )
+        gate_result.estimated_tokens = gate_result.selected_bytes // 4
     modified_messages = inject_context_to_messages(
-        messages, gate_result.selected_files, base_dir=context_dir
+        messages, selected_files, base_dir=context_dir
     )
     body["messages"] = modified_messages
 

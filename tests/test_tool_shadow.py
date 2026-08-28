@@ -189,7 +189,7 @@ def test_summarize_long_dict_response(monkeypatch):
 
     monkeypatch.setattr("ollama.chat", _fake_chat)
     long_out = "q" * (SUMMARIZE_THRESHOLD + 1)
-    out = _run(summarize_exploration("View", long_out))
+    out = _run(summarize_exploration("GrepTool", long_out))
     assert out == "dict summary"
 
 
@@ -203,4 +203,73 @@ def test_summarize_long_raising(monkeypatch):
     long_out = "z" * (SUMMARIZE_THRESHOLD + 1)
     out = _run(summarize_exploration("GrepTool", long_out))
     assert "z" * SUMMARIZE_THRESHOLD in out
+    assert "truncated" in out
+
+
+@pytest.mark.parametrize("tool_name", ["View", "read_file", "FileRead"])
+def test_reader_long_passthrough_no_ollama(monkeypatch, tool_name):
+    """Reader tool output over the threshold passes through; ollama never runs."""
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("ollama.chat must not be called for reader tools")
+
+    monkeypatch.setattr("ollama.chat", _fail)
+    long_out = "s" * (SUMMARIZE_THRESHOLD + 1)
+    out = _run(summarize_exploration(tool_name, long_out))
+    assert out == long_out
+
+
+@pytest.mark.parametrize("tool_name", ["View", "read_file", "FileRead"])
+def test_reader_over_max_still_bounded(monkeypatch, tool_name):
+    """Reader tool output over MAX_OUTPUT_CHARS is bounded, never summarized."""
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("ollama.chat must not be called for reader tools")
+
+    monkeypatch.setattr("ollama.chat", _fail)
+    huge = "s" * (MAX_OUTPUT_CHARS + 1000)
+    out = _run(summarize_exploration(tool_name, huge))
+    assert len(out) <= MAX_OUTPUT_CHARS
+    assert "truncated" in out
+
+
+def test_non_reader_long_calls_ollama(monkeypatch):
+    """Non-reader tool output over the threshold still calls ollama.chat."""
+
+    calls = {"count": 0}
+
+    def _fake_chat(**kwargs):
+        calls["count"] += 1
+        return {"message": {"content": "mock summary"}}
+
+    monkeypatch.setattr("ollama.chat", _fake_chat)
+    long_out = "g" * (SUMMARIZE_THRESHOLD + 1)
+    out = _run(summarize_exploration("GrepTool", long_out))
+    assert out == "mock summary"
+    assert calls["count"] == 1
+
+
+@pytest.mark.parametrize("tool_name", TOOL_NAMES)
+def test_short_unchanged_any_tool(monkeypatch, tool_name):
+    """Short output (<= threshold) passes through unchanged for every tool."""
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("ollama.chat must not be called for short output")
+
+    monkeypatch.setattr("ollama.chat", _fail)
+    short = "c" * SUMMARIZE_THRESHOLD
+    out = _run(summarize_exploration(tool_name, short))
+    assert out == short
+
+
+def test_non_reader_raising_falls_back_truncated(monkeypatch):
+    """Non-reader: ollama.chat raising -> truncated raw output, never raises."""
+
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("ollama down")
+
+    monkeypatch.setattr("ollama.chat", _raise)
+    long_out = "t" * (SUMMARIZE_THRESHOLD + 1)
+    out = _run(summarize_exploration("GlobTool", long_out))
+    assert "t" * SUMMARIZE_THRESHOLD in out
     assert "truncated" in out

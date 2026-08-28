@@ -13,7 +13,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from router.dispatcher import inject_context_to_messages
+from router.dispatcher import (
+    _expand_selected_with_imports,
+    inject_context_to_messages,
+)
 
 
 @pytest.fixture
@@ -121,3 +124,87 @@ def test_content_structure_has_file_start_markers(cwd_tmp):
     assert "--- FILE END ---" in last
     assert "PRE-LOADED CONTEXT" in last
     assert "print('x')" in last
+
+
+def test_expand_selected_with_imports_appends_imported_module(cwd_tmp):
+    """FIX #3: expanding ['a.py'] (which does `import b`) yields ['a.py', 'b.py'],
+    and inject_context_to_messages emits BOTH file blocks."""
+    (cwd_tmp / "a.py").write_text("import b\n\ndef a():\n    return b.VALUE\n")
+    (cwd_tmp / "b.py").write_text("VALUE = 1\n")
+
+    expanded = _expand_selected_with_imports(["a.py"], base_dir=".")
+
+    assert expanded == ["a.py", "b.py"]
+
+    messages = [_user_message("use a and b")]
+    out = inject_context_to_messages(messages, expanded)
+    last = _last_user_content(out)
+    assert "--- FILE START: a.py ---" in last
+    assert "--- FILE START: b.py ---" in last
+
+
+def test_expand_selected_with_imports_resolves_dotted_and_relative(cwd_tmp):
+    """FIX #3: `from . import util` (sibling) and `import pkg.mod` (root-relative)
+    both resolve to existing local modules; selected file stays first."""
+    pkg = cwd_tmp / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "util.py").write_text("UTIL = 1\n")
+    (pkg / "mod.py").write_text("MOD = 2\n")
+    (pkg / "a.py").write_text("from . import util\nimport pkg.mod\n")
+
+    expanded = _expand_selected_with_imports(["pkg/a.py"], base_dir=".")
+
+    assert expanded == ["pkg/a.py", "pkg/util.py", "pkg/mod.py"]
+
+
+def test_expand_selected_with_imports_skips_missing_and_duplicates(cwd_tmp):
+    """FIX #3: stdlib/third-party imports that do not exist under base_dir are
+    skipped, and already-selected files are not duplicated."""
+    (cwd_tmp / "a.py").write_text("import os\nimport sys\nimport b\n")
+    (cwd_tmp / "b.py").write_text("B = 1\n")
+
+    expanded = _expand_selected_with_imports(["a.py", "b.py"], base_dir=".")
+
+    # b.py was already selected; os/sys do not exist under base_dir.
+    assert expanded == ["a.py", "b.py"]
+
+
+def test_expand_resolves_multidot_relative_import(cwd_tmp):
+    """FIX #3 (review): ``from ..util import y`` walks up one package level, so a
+    file in ``pkg/sub/`` resolves ``pkg/util.py``, not ``pkg/sub/util.py``."""
+    pkg = cwd_tmp / "pkg"
+    (pkg / "sub").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "util.py").write_text("UTIL = 1\n")
+    (pkg / "sub" / "__init__.py").write_text("")
+    (pkg / "sub" / "a.py").write_text("from ..util import y\n")
+
+    expanded = _expand_selected_with_imports(["pkg/sub/a.py"], base_dir=".")
+
+    assert expanded == ["pkg/sub/a.py", "pkg/util.py"]
+
+
+def test_expand_budget_cap_drops_imports_that_do_not_fit(cwd_tmp):
+    """FIX #3 (review): appended imports are capped at budget_tokens (1 token ≈
+    4 bytes). A tiny budget that fits only the selected file drops the import;
+    without the cap the import would push the injection over budget."""
+    (cwd_tmp / "a.py").write_text("import b\n")
+    # Selected file: 9 bytes. b.py: 7 bytes. Budget 3 tokens = 12 bytes fits
+    # a.py but not a.py + b.py (16 bytes).
+    (cwd_tmp / "b.py").write_text("B = 1\n")
+
+    expanded = _expand_selected_with_imports(["a.py"], base_dir=".", budget_tokens=3)
+
+    assert expanded == ["a.py"]
+
+
+def test_expand_budget_keeps_imports_that_fit(cwd_tmp):
+    """FIX #3 (review): imports that fit within budget_tokens are still appended."""
+    (cwd_tmp / "a.py").write_text("import b\n")
+    (cwd_tmp / "b.py").write_text("B = 1\n")
+
+    # 16 bytes total <= 16 bytes (4 tokens) -> import survives.
+    expanded = _expand_selected_with_imports(["a.py"], base_dir=".", budget_tokens=4)
+
+    assert expanded == ["a.py", "b.py"]
