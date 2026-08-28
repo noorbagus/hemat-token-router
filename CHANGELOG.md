@@ -1,6 +1,13 @@
 # Changelog
 
 ## [Unreleased]
+### Structured JSONL logging — source-level events (Wave 3, 2026-08-28)
+- **Source-level logging**: 17 event baru di tiap service function (sebelumnya cuma 6 event dari `dispatcher.py`). AI coding tools kini bisa trace seluruh pipeline di titik keputusan masing-masing: cache (routing), fallback heuristic, gate, import expansion + budget drop, context inject, summarizer decision, CLI dispatch, server lifecycle, dan ops (passthrough/health/retry).
+- **Consolidation (1 record/keputusan)**: `AST_SCANNED`, `OLLAMA_TRIAGE`, `TOOL_LOCAL_EXEC` dipindah dari dispatcher ke emitter source-nya (`ast_extractor`, `ollama_scorer`, `tool_shadow`) — hapus duplikasi emit. `OLLAMA_TRIAGE` kehilangan `session`/`cache_hit` → re-home ke `ROUTING_CACHE_*` + `GATE_APPLIED`.
+- **`trace_id` → contextvars**: ganti global lock dengan `contextvars.ContextVar` scoped per async task; `asyncio.to_thread` membawa context ke worker thread sehingga event source-level tercoret trace yang sama. Menutup MAJOR race global `trace_id` (TASKS.md).
+- Konstanta event lengkap di `router/logger.py` + tabel event→emitter di `CONTRACTS.md` §2.
+- Tests: 139 → +per-module event-emission tests + e2e full-chain event order (single trace_id, no duplicates).
+
 ### A/B Test: request-count vs output correctness (2026-08-28)
 - `docs/ab-test-request-count.md` — proxy (csmart inject + shadow) vs direct agent loop pada 2 task refactor: ARK calls **10→1** (S1) dan **≥12→2** (S2) = savings request 83-90%.
 - **Output verification negatif**: kedua output proxy **tidak dapat dipakai** (S2 = patch malformed + constructor fiktif `max_size`/`env_ttl_key`; S1 = implementasi duplikat `routing_cache.py`). Working tree baseline sudah 15 test gagal (WIP migrasi cache setengah jadi) dan output model tidak memperbaikinya. Savings request real, tapi value belum terbukti.

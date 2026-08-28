@@ -5,11 +5,14 @@ to create a compact token-efficient skeleton for routing.
 """
 
 import os
+import time
 from pathlib import Path
 from typing import List, Dict
 
 from tree_sitter import Node
 from tree_sitter_language_pack import get_parser
+
+from router.logger import AST_SCANNED, logger
 
 
 # Map file extensions to tree-sitter language names
@@ -127,8 +130,11 @@ def scan_project_codebase(root_dir: str, ignore_dirs: set[str]) -> list[str]:
     Returns:
         List of skeletons (strings), one per supported file.
     """
+    start = time.monotonic()
     skeletons: list[str] = []
     root_path = Path(root_dir)
+    files_encountered = 0
+    parse_failures = 0
 
     for dirpath, dirnames, filenames in os.walk(root_path):
         # Filter out ignored directories (modify in-place for os.walk)
@@ -139,9 +145,21 @@ def scan_project_codebase(root_dir: str, ignore_dirs: set[str]) -> list[str]:
             if ext not in EXTENSION_TO_LANG:
                 continue
 
+            files_encountered += 1
             file_path = Path(dirpath) / filename
             skeleton = extract_ast_skeleton(str(file_path))
             if skeleton:
                 skeletons.append(skeleton)
+            else:
+                parse_failures += 1
+
+    logger.log(
+        AST_SCANNED,
+        root_dir=str(root_dir),
+        scanned_files_count=len(skeletons),
+        files_encountered=files_encountered,
+        parse_failures=parse_failures,
+        duration_ms=int((time.monotonic() - start) * 1000),
+    )
 
     return skeletons

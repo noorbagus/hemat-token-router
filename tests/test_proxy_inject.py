@@ -5,6 +5,7 @@ The path-validation base is ``.`` (CWD), so each test chdirs into ``tmp_path``
 via the ``cwd_tmp`` fixture and restores the original CWD afterwards.
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -13,10 +14,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import router.dispatcher as mod
 from router.dispatcher import (
     _expand_selected_with_imports,
     inject_context_to_messages,
 )
+from router.logger import StructuredLogger
 
 
 @pytest.fixture
@@ -43,6 +46,21 @@ def _last_user_content(messages):
 
 def _warned_about(caplog, needle: str) -> bool:
     return any(needle in r.getMessage() for r in caplog.records)
+
+
+def _read_records(tmp_path):
+    """Read every JSONL record written to the capture logger's session file."""
+    (f,) = tmp_path.glob("session_*.jsonl")
+    return [json.loads(l) for l in f.read_text("utf-8").strip().splitlines()]
+
+
+@pytest.fixture
+def capture_logger(tmp_path, monkeypatch):
+    """Replace ``router.dispatcher.logger`` with an in-test StructuredLogger."""
+    cap = StructuredLogger(log_dir=tmp_path)
+    monkeypatch.setattr(mod, "logger", cap)
+    yield cap
+    cap.close()
 
 
 def test_relative_file_injected_into_last_user_message(cwd_tmp):
@@ -208,3 +226,54 @@ def test_expand_budget_keeps_imports_that_fit(cwd_tmp):
     expanded = _expand_selected_with_imports(["a.py"], base_dir=".", budget_tokens=4)
 
     assert expanded == ["a.py", "b.py"]
+
+
+# ---------------------------------------------------------------------------
+# Source-level structured-log emission tests (CONTEXT_INJECTED / IMPORT_EXPANSION).
+# ---------------------------------------------------------------------------
+
+
+def test_context_injected_event_emitted(cwd_tmp, capture_logger):
+    """CONTEXT_INJECTED is logged once with the real injection counts."""
+    src = cwd_tmp / "a.py"
+    src.write_text("def hello():\n    return 1\n")
+
+    messages = [_user_message("fix it")]
+    out = mod.inject_context_to_messages(messages, ["a.py"])
+
+    assert out is not messages
+    capture_logger.flush()
+    records = _read_records(cwd_tmp)
+    injected = [r for r in records if r["event"] == "CONTEXT_INJECTED"]
+    assert len(injected) == 1, f"expected one CONTEXT_INJECTED, got {len(injected)}"
+    rec = injected[0]
+    assert rec["files_requested"] == 1
+    assert rec["files_injected"] == 1
+    assert rec["skipped_count"] == 0
+    assert rec["bytes_injected"] == len("def hello():\n    return 1\n")
+    assert rec["base_dir"] == "."
+
+
+def test_import_expansion_event_counts_budget_drops(cwd_tmp, capture_logger):
+    """IMPORT_EXPANSION records dropped_by_budget when imports do not fit."""
+    (cwd_tmp / "a.py").write_text("import b\n")
+    # Selected file is 9 bytes; b.py is 6 bytes. Budget 3 tokens = 12 bytes fits
+    # a.py but not a.py + b.py (15 bytes), so the candidate import is dropped.
+    (cwd_tmp / "b.py").write_text("B = 1\n")
+
+    expanded = mod._expand_selected_with_imports(
+        ["a.py"], base_dir=".", budget_tokens=3
+    )
+
+    assert expanded == ["a.py"]
+    capture_logger.flush()
+    records = _read_records(cwd_tmp)
+    imp = [r for r in records if r["event"] == "IMPORT_EXPANSION"]
+    assert len(imp) == 1, f"expected one IMPORT_EXPANSION, got {len(imp)}"
+    rec = imp[0]
+    assert rec["dropped_by_budget"] >= 1
+    assert rec["appended_count"] == 0
+    assert rec["expanded_count"] == len(expanded) == 1
+    assert rec["selected_count"] == 1
+    assert rec["budget_tokens"] == 3
+    assert rec["total_bytes"] == 9

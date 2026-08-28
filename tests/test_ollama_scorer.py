@@ -5,6 +5,7 @@ keyword fallback is exercised directly on ast_extractor-format skeletons
 (``// <path>`` header lines followed by ``- <signature>`` lines).
 """
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,8 +13,10 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import ollama  # noqa: E402
+import pytest  # noqa: E402
 
 import router.ollama_scorer as scorer  # noqa: E402
+from router.logger import StructuredLogger  # noqa: E402
 from router.ollama_scorer import (  # noqa: E402
     DEFAULT_TRIAGE_MODEL,
     _keyword_heuristic,
@@ -22,6 +25,20 @@ from router.ollama_scorer import (  # noqa: E402
 )
 
 JSON_OK = '{"target_files": ["a.py"], "confidence": 0.9, "reasoning": "x"}'
+JSON_TRIAGE = '{"target_files": ["a.py"], "confidence": 0.9, "reasoning": "clear"}'
+
+
+@pytest.fixture
+def capture_logger(tmp_path, monkeypatch):
+    """Replace the module logger with a temp-file StructuredLogger."""
+    lg = StructuredLogger(log_dir=tmp_path)
+    monkeypatch.setattr(scorer, "logger", lg)
+    return lg
+
+
+def _read_records(tmp_path):
+    (f,) = tmp_path.glob("session_*.jsonl")
+    return [json.loads(line) for line in f.read_text("utf-8").strip().splitlines()]
 
 
 def test_default_triage_model_constant() -> None:
@@ -153,3 +170,72 @@ def test_keyword_heuristic_no_keywords() -> None:
 def test_keyword_heuristic_existing_keywords() -> None:
     """Sanity: the scorer module exposes the fallback without import errors."""
     assert callable(scorer._keyword_heuristic)
+
+
+def test_ollama_path_emits_triage_source_ollama(capture_logger, monkeypatch, tmp_path) -> None:
+    """Ollama success path logs exactly one OLLAMA_TRIAGE with source="ollama"."""
+    monkeypatch.delenv("OLLAMA_TRIAGE_MODEL", raising=False)
+
+    def fake_chat(**kwargs):
+        return SimpleNamespace(message=SimpleNamespace(content=JSON_TRIAGE))
+
+    monkeypatch.setattr(scorer.ollama, "chat", fake_chat)
+    result = route_target_files("// a.py\n- def a()\n", "fix a")
+    assert result.target_files == ["a.py"]
+
+    capture_logger.flush()
+    records = _read_records(tmp_path)
+    triages = [r for r in records if r["event"] == "OLLAMA_TRIAGE"]
+    assert len(triages) == 1
+    assert triages[0]["source"] == "ollama"
+    assert triages[0]["model"] == DEFAULT_TRIAGE_MODEL
+    assert triages[0]["confidence"] == 0.9
+    assert triages[0]["selected_files"] == ["a.py"]
+    assert triages[0]["duration_ms"] >= 0
+
+
+def test_fallback_path_emits_heuristic_triage_and_fallback(capture_logger, monkeypatch, tmp_path) -> None:
+    """Fallback path logs OLLAMA_FALLBACK + OLLAMA_TRIAGE(source="heuristic")."""
+    monkeypatch.delenv("OLLAMA_TRIAGE_MODEL", raising=False)
+
+    def fake_chat(**kwargs):
+        raise ConnectionError("boom")
+
+    monkeypatch.setattr(scorer.ollama, "chat", fake_chat)
+    result = route_target_files(
+        "// fake/module.py\n- def compute()\n", "add compute to fake/module.py"
+    )
+    assert result.target_files == ["fake/module.py"]
+
+    capture_logger.flush()
+    records = _read_records(tmp_path)
+    fallbacks = [r for r in records if r["event"] == "OLLAMA_FALLBACK"]
+    triages = [r for r in records if r["event"] == "OLLAMA_TRIAGE"]
+
+    assert len(fallbacks) == 1
+    assert "boom" in fallbacks[0]["error"]
+    assert fallbacks[0]["keywords_count"] >= 1
+    assert fallbacks[0]["matched_files"] >= 1
+    assert fallbacks[0]["confidence"] == result.confidence
+
+    assert len(triages) == 1
+    assert triages[0]["source"] == "heuristic"
+    assert triages[0]["model"] == DEFAULT_TRIAGE_MODEL
+    assert triages[0]["selected_files"] == ["fake/module.py"]
+
+
+def test_no_keywords_emits_fallback_only(capture_logger, tmp_path) -> None:
+    """No-keywords prompt logs OLLAMA_FALLBACK with keywords_count=0, no triage."""
+    result = _keyword_heuristic("// a.py\n- def a()\n", "hi", "boom")
+    assert result.target_files == []
+
+    capture_logger.flush()
+    records = _read_records(tmp_path)
+    fallbacks = [r for r in records if r["event"] == "OLLAMA_FALLBACK"]
+    triages = [r for r in records if r["event"] == "OLLAMA_TRIAGE"]
+
+    assert len(fallbacks) == 1
+    assert fallbacks[0]["keywords_count"] == 0
+    assert fallbacks[0]["matched_files"] == 0
+    assert "boom" in fallbacks[0]["error"]
+    assert len(triages) == 0

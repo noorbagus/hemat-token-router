@@ -40,12 +40,16 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from router import ast_extractor, ollama_scorer
 from router.gate import GateResult, apply_gate
 from router.logger import (
-    AST_SCANNED,
+    AST_CACHE_HIT,
+    CONTEXT_INJECTED,
+    IMPORT_EXPANSION,
     INBOUND_REQUEST,
-    OLLAMA_TRIAGE,
+    OLLAMA_HEALTH,
+    PASSTHROUGH,
     SSE_STREAM_COMPLETE,
-    TOOL_LOCAL_EXEC,
     TOOL_SHADOW_INTERCEPT,
+    UPSTREAM_HEALTH,
+    UPSTREAM_RETRY,
     logger,
 )
 from router.ollama_scorer import RoutingResult, triage_model
@@ -278,9 +282,18 @@ def inject_context_to_messages(
     *base_dir* are read.
     """
     if not selected_files:
+        logger.log(
+            CONTEXT_INJECTED,
+            files_requested=0,
+            files_injected=0,
+            skipped_count=0,
+            bytes_injected=0,
+            base_dir=base_dir,
+        )
         return messages
 
     context_blocks: List[str] = []
+    bytes_injected = 0
     for file_path in selected_files:
         try:
             resolved = resolve_under_base(file_path, base_dir)
@@ -302,11 +315,20 @@ def inject_context_to_messages(
                 "skipping unreadable selected file %r: %s", file_path, exc
             )
             continue
+        bytes_injected += len(content.encode("utf-8"))
         context_blocks.append(
             f"--- FILE START: {file_path} ---\n{content}\n--- FILE END ---\n"
         )
 
     if not context_blocks:
+        logger.log(
+            CONTEXT_INJECTED,
+            files_requested=len(selected_files),
+            files_injected=0,
+            skipped_count=len(selected_files),
+            bytes_injected=0,
+            base_dir=base_dir,
+        )
         return messages
 
     injected_context = "\n".join([
@@ -324,6 +346,14 @@ def inject_context_to_messages(
                 new_messages[i]["content"] = new_content
             break
 
+    logger.log(
+        CONTEXT_INJECTED,
+        files_requested=len(selected_files),
+        files_injected=len(context_blocks),
+        skipped_count=len(selected_files) - len(context_blocks),
+        bytes_injected=bytes_injected,
+        base_dir=base_dir,
+    )
     return new_messages
 
 
@@ -475,6 +505,9 @@ def _expand_selected_with_imports(
         _sum_selected_bytes(ordered, base_dir=base) if budget_bytes is not None else 0
     )
 
+    appended_count = 0
+    dropped_by_budget = 0
+
     for rel in selected_files:
         try:
             resolved = resolve_under_base(rel, base)
@@ -505,11 +538,26 @@ def _expand_selected_with_imports(
                 except OSError:
                     size = 0
                 if total_bytes + size > budget_bytes:
-                    continue  # import doesn't fit the token budget — drop it
+                    # import doesn't fit the token budget — drop it
+                    dropped_by_budget += 1
+                    continue
                 total_bytes += size
             seen.add(relpath)
             ordered.append(relpath)
+            appended_count += 1
 
+    if budget_bytes is None:
+        total_bytes = _sum_selected_bytes(ordered, base_dir=base)
+    logger.log(
+        IMPORT_EXPANSION,
+        base_dir=base,
+        selected_count=len(selected_files),
+        appended_count=appended_count,
+        expanded_count=len(ordered),
+        dropped_by_budget=dropped_by_budget,
+        budget_tokens=budget_tokens,
+        total_bytes=total_bytes,
+    )
     return ordered
 
 
@@ -519,6 +567,12 @@ async def _get_or_scan_ast(context_dir: str) -> List[str]:
     with _AST_CACHE_LOCK:
         cached = _AST_CACHE.get(key)
     if cached is not None:
+        logger.log(
+            AST_CACHE_HIT,
+            context_dir=context_dir,
+            scanned_files_count=len(cached),
+            cache_size=len(_AST_CACHE),
+        )
         return cached
     skeletons = await asyncio.to_thread(
         ast_extractor.scan_project_codebase, context_dir, DEFAULT_IGNORE_DIRS
@@ -604,16 +658,8 @@ async def run_local_routing(
     every message (AST is still cached either way).
     """
     skeletons = await _get_or_scan_ast(context_dir)
-    logger.log(
-        AST_SCANNED,
-        trace_id=trace_id,
-        context_dir=context_dir,
-        scanned_files_count=len(skeletons),
-    )
     full_skeleton = _cap_skeleton("\n".join(skeletons))
 
-    t0 = time.monotonic()
-    cache_hit = False
     if session_key:
         routing = _ROUTING_CACHE.get(session_key)  # recency bump inside class
         if routing is None:
@@ -635,9 +681,6 @@ async def run_local_routing(
                 ollama_scorer.route_target_files, full_skeleton, prompt
             )
             _ROUTING_TTL_CACHE.put(ttl_key, routing)
-        else:
-            cache_hit = True
-    routing_ms = int((time.monotonic() - t0) * 1000)
 
     # apply_gate takes tokens (it converts to bytes internally); the old `* 4`
     # passed bytes-as-tokens, making the budget 4x too lenient (review MAJOR).
@@ -647,15 +690,6 @@ async def run_local_routing(
         CONFIDENCE_THRESHOLD,
         DEFAULT_BUDGET_TOKENS,
         base_dir=context_dir,
-    )
-    logger.log(
-        OLLAMA_TRIAGE,
-        trace_id=trace_id,
-        session=session_key,
-        selected_files=gate_result.selected_files,
-        confidence=routing.confidence,
-        duration_ms=routing_ms,
-        cache_hit=cache_hit,
     )
     return gate_result
 
@@ -693,6 +727,12 @@ async def _request_upstream(
                 raise UpstreamError(
                     f"upstream request failed after {attempts} attempts: {exc}"
                 ) from exc
+            logger.log(
+                UPSTREAM_RETRY,
+                attempt=attempts,
+                max_retries=MAX_UPSTREAM_RETRIES,
+                error=str(exc)[:200],
+            )
             await asyncio.sleep(0.25 * attempts)
 
 
@@ -772,6 +812,11 @@ class _ShadowStreamer:
         self.session_key = session_key
         self.context_dir = context_dir
         self.trace_id = trace_id or str(uuid4())
+        # Insurance: if the streamer is ever constructed outside the request task
+        # that called logger.set_trace_id, stamp the trace id here so every
+        # source-level event of the shadow loop shares it (contextvars propagate
+        # into asyncio.to_thread worker threads and asyncio.gather child tasks).
+        logger.set_trace_id(self.trace_id)
         self.round = 1
         self.shadow_used = 0
         self.client_index = 0
@@ -1041,12 +1086,6 @@ class _ShadowStreamer:
                     ),
                 }
             raw = await execute_local_tool(block["name"], tool_input, self.context_dir)
-            logger.log(
-                TOOL_LOCAL_EXEC,
-                trace_id=self.trace_id,
-                tool_name=block["name"],
-                chars=len(raw),
-            )
             summarized = await summarize_exploration(block["name"], raw)
             return {**block, "input": tool_input, "content": summarized}
 
@@ -1393,6 +1432,7 @@ async def passthrough_request(request: Request, path: str) -> Response:
     headers = _build_upstream_headers(request)
     timeout = _upstream_timeout()
 
+    t0 = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=timeout, transport=_UPSTREAM_TRANSPORT) as client:
             req = client.build_request(
@@ -1410,8 +1450,22 @@ async def passthrough_request(request: Request, path: str) -> Response:
             }
             media_type = resp.headers.get("content-type")
     except Exception as exc:  # noqa: BLE001 - surface as 502
+        logger.log(
+            PASSTHROUGH,
+            path=path,
+            method=request.method,
+            status_code=502,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+        )
         return Response(f"Upstream error: {exc}", status_code=502)
 
+    logger.log(
+        PASSTHROUGH,
+        path=path,
+        method=request.method,
+        status_code=status,
+        duration_ms=int((time.monotonic() - t0) * 1000),
+    )
     return Response(
         content=content,
         status_code=status,
@@ -1427,11 +1481,25 @@ async def passthrough_request(request: Request, path: str) -> Response:
 
 async def check_upstream_health() -> bool:
     """Check if the upstream gateway is reachable."""
+    t0 = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=5.0, transport=_UPSTREAM_TRANSPORT) as client:
             resp = await client.get(f"{UPSTREAM_BASE_URL}/v1/models")
-            return resp.status_code < 500
+            ok = resp.status_code < 500
+            logger.log(
+                UPSTREAM_HEALTH,
+                ok=ok,
+                status_code=resp.status_code,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+            )
+            return ok
     except Exception:
+        logger.log(
+            UPSTREAM_HEALTH,
+            ok=False,
+            status_code=None,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+        )
         return False
 
 
@@ -1439,8 +1507,16 @@ def check_ollama_health() -> bool:
     """Check if Ollama is running and the model is available."""
     import ollama
 
+    model = triage_model()
     try:
-        ollama.show(triage_model())
+        ollama.show(model)
+        logger.log(OLLAMA_HEALTH, ok=True, model=model, error=None)
         return True
-    except Exception:
+    except Exception as exc:
+        logger.log(
+            OLLAMA_HEALTH,
+            ok=False,
+            model=model,
+            error=str(exc)[:200],
+        )
         return False

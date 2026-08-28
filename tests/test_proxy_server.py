@@ -19,14 +19,31 @@ from fastapi import Request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Real implementations captured at import time — the autouse ``_hermetic``
+# fixture re-points these module attributes per-test; the e2e test restores
+# them so the REAL source-level AST_SCANNED / OLLAMA_TRIAGE events fire.
+from router.ast_extractor import scan_project_codebase as _REAL_SCAN_PROJECT
+from router.logger import StructuredLogger
+from router.ollama_scorer import route_target_files as _REAL_ROUTE_TARGET_FILES
 from router.dispatcher import app, inject_context_to_messages
 from router.ollama_scorer import RoutingResult
+import router.ast_extractor as ast_mod
 import router.dispatcher as dispatcher
+import router.gate as gate_mod
+import router.ollama_scorer as os_mod
+import router.routing_cache as rc_mod
+import router.tool_shadow as ts_mod
 
 
 def _run(coro):
     """Run a coroutine to completion with a fresh event loop."""
     return asyncio.run(coro)
+
+
+def _read_records(tmp_path):
+    """Read every JSONL record written to a StructuredLogger in ``tmp_path``."""
+    (f,) = tmp_path.glob("session_*.jsonl")
+    return [json.loads(l) for l in f.read_text("utf-8").strip().splitlines()]
 
 
 def _asgi_request(req: httpx.Request, *, client=("127.0.0.1", 123)) -> Request:
@@ -1116,3 +1133,114 @@ def test_ttl_cache_reads_env_ttl():
             os.environ.pop("CSMART_ROUTING_TTL", None)
         else:
             os.environ["CSMART_ROUTING_TTL"] = orig
+
+
+# ---------------------------------------------------------------------------
+# Full-chain e2e: one intercepted request drives the REAL pipeline (AST scan,
+# Ollama triage, gate, import expansion, injection, shadow loop) and emits an
+# ordered, single-trace_id event chain with no duplicated source-level events.
+# ---------------------------------------------------------------------------
+
+
+def test_full_chain_event_sequence(mock_upstream, tmp_path, monkeypatch):
+    """The real pipeline logs every source event once, in order, one trace_id.
+
+    Intentionally bypasses the autouse ``_hermetic`` fixture's scan/routing
+    stubs (restored to the REAL implementations) so the source-level
+    AST_SCANNED / OLLAMA_TRIAGE events fire from ast_extractor / ollama_scorer;
+    only ``ollama.chat`` is stubbed with canned JSON. The GrepTool round makes
+    the shadow loop fire TOOL_SHADOW_INTERCEPT -> TOOL_LOCAL_EXEC ->
+    TOOL_SUMMARIZE.
+    """
+    # Undo the autouse _hermetic stubs so the REAL source events fire.
+    monkeypatch.setattr(ast_mod, "scan_project_codebase", _REAL_SCAN_PROJECT)
+    monkeypatch.setattr(os_mod, "route_target_files", _REAL_ROUTE_TARGET_FILES)
+
+    # A tiny real project so the AST scan finds one file.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "app.py").write_text("VALUE = 42\n\ndef run():\n    return VALUE\n")
+    monkeypatch.setenv("CSMART_CONTEXT_DIR", str(proj))
+
+    # Canned Ollama triage: route to the single project file with high confidence.
+    class _FakeMessage:
+        def __init__(self, content: str):
+            self.content = content
+
+    class _FakeOllamaResponse:
+        def __init__(self, content: str):
+            self.message = _FakeMessage(content)
+
+    def _fake_chat(**kwargs):
+        return _FakeOllamaResponse(
+            '{"target_files":["app.py"],"confidence":0.9,"reasoning":"ok"}'
+        )
+
+    monkeypatch.setattr(os_mod.ollama, "chat", _fake_chat)
+
+    # One shared capture logger across every module that emits source events.
+    cap = StructuredLogger(log_dir=tmp_path)
+    for m in (dispatcher, ast_mod, os_mod, ts_mod, gate_mod, rc_mod):
+        monkeypatch.setattr(m, "logger", cap)
+
+    # Upstream: a GrepTool round (held + run locally) then a plain text round.
+    partial = '{"pattern": "zzz_no_match_abc"}'
+    partial_escaped = partial.replace('"', '\\"')
+    round1 = _sse_tool_use_round("GrepTool", "tu_grep", partial_escaped)
+    round2 = _sse_text("done")
+    calls = mock_upstream([round1, round2])
+
+    resp = _run(_post_messages())
+
+    assert resp.status_code == 200
+    assert "done" in resp.text
+    assert len(calls) == 2
+
+    cap.flush()
+    cap.close()
+    records = _read_records(tmp_path)
+    events = [r["event"] for r in records]
+
+    # --- single shared trace_id (non-None) across every module's records ---
+    trace_ids = {r["trace_id"] for r in records}
+    assert None not in trace_ids, "some records are missing a trace_id"
+    assert len(trace_ids) == 1, f"expected one trace_id, got {len(trace_ids)}"
+
+    # --- exact-once source-level events (no dispatcher duplicates) ---
+    assert events.count("INBOUND_REQUEST") == 1
+    assert events.count("AST_SCANNED") == 1
+    assert events.count("OLLAMA_TRIAGE") == 1
+    assert events.count("TOOL_LOCAL_EXEC") == 1
+    assert events.count("SSE_STREAM_COMPLETE") == 1
+
+    # --- strict order of the non-cache pipeline events ---
+    core = [
+        "INBOUND_REQUEST",
+        "OLLAMA_TRIAGE",
+        "GATE_APPLIED",
+        "IMPORT_EXPANSION",
+        "CONTEXT_INJECTED",
+        "TOOL_SHADOW_INTERCEPT",
+        "TOOL_LOCAL_EXEC",
+        "TOOL_SUMMARIZE",
+        "SSE_STREAM_COMPLETE",
+    ]
+    filtered = [e for e in events if e in core]
+    assert filtered == core, f"pipeline order mismatch: {filtered}"
+
+    # AST_SCANNED lands between INBOUND_REQUEST and OLLAMA_TRIAGE.
+    assert (
+        events.index("INBOUND_REQUEST")
+        < events.index("AST_SCANNED")
+        < events.index("OLLAMA_TRIAGE")
+    )
+
+    # ROUTING_CACHE_* present and confined to the routing window.
+    cache_events = [e for e in events if e.startswith("ROUTING_CACHE")]
+    assert cache_events, "expected at least one ROUTING_CACHE_* event"
+    assert "ROUTING_CACHE_MISS" in cache_events
+    idx_inbound = events.index("INBOUND_REQUEST")
+    idx_gate = events.index("GATE_APPLIED")
+    for i, e in enumerate(events):
+        if e.startswith("ROUTING_CACHE"):
+            assert idx_inbound < i < idx_gate, f"{e} at {i} outside routing window"

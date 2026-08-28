@@ -18,7 +18,13 @@ from collections.abc import Iterable
 
 import uvicorn
 
-from router.dispatcher import app, check_ollama_health, check_upstream_health
+from router.dispatcher import (
+    UPSTREAM_BASE_URL,
+    app,
+    check_ollama_health,
+    check_upstream_health,
+)
+from router.logger import SERVER_START, SERVER_STOP, logger
 from router.logs_viewer import DEFAULT_LOG_DIR, cmd_logs, cmd_stats
 from router.ollama_scorer import triage_model
 
@@ -257,13 +263,29 @@ def cmd_status() -> None:
         sys.exit(1)
 
 
-def cmd_start(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+def cmd_start(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    context_dir: str = ".",
+) -> None:
     """Start the local reverse proxy server."""
     print(f"csmart starting reverse proxy on {host}:{port}")
     print(f"  Upstream: {os.environ.get('ANTHROPIC_UPSTREAM_URL', 'https://ark.talaga.my.id')}")
     print(f"  Set ANTHROPIC_BASE_URL=http://{host}:{port} in your shell before running claude")
     print()
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    logger.log(
+        SERVER_START,
+        host=host,
+        port=port,
+        upstream_base_url=UPSTREAM_BASE_URL,
+        ollama_model=triage_model(),
+        context_dir=context_dir,
+    )
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="info")
+    finally:
+        logger.log(SERVER_STOP, host=host, port=port)
+        logger.flush()
 
 
 def main_cli(argv: list[str] | None = None) -> None:
@@ -298,7 +320,7 @@ def main_cli(argv: list[str] | None = None) -> None:
         return  # cmd_status exits itself; this return is for testability
 
     if args.command == "start":
-        cmd_start(args.host, args.port)
+        cmd_start(args.host, args.port, args.context_dir)
         return
 
     if args.command == "logs":

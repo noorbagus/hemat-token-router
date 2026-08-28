@@ -1,9 +1,12 @@
 import json
 import os
 import re
+import time
 from typing import List, Optional
 from pydantic import BaseModel
 import ollama
+
+from router.logger import OLLAMA_FALLBACK, OLLAMA_TRIAGE, logger
 
 DEFAULT_TRIAGE_MODEL = "qwen2.5-coder:7b"
 
@@ -31,6 +34,7 @@ def route_target_files(skeleton: str, user_prompt: str) -> RoutingResult:
     Returns:
         RoutingResult with target_files, confidence, and reasoning
     """
+    start = time.monotonic()
     system_prompt = """
 You are a code routing expert. Given a codebase skeleton with file paths and AST signatures,
 and a user's change request, identify 1-3 target files that **must** be modified to implement the request.
@@ -95,15 +99,33 @@ Respond with JSON only.
         elif len(reasoning) > 120:
             reasoning = reasoning[:117] + "..."
 
-        return RoutingResult(
+        result = RoutingResult(
             target_files=target_files,
             confidence=confidence,
             reasoning=reasoning,
         )
+        logger.log(
+            OLLAMA_TRIAGE,
+            model=triage_model(),
+            source="ollama",
+            confidence=result.confidence,
+            selected_files=result.target_files,
+            reasoning=result.reasoning,
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+        return result
 
     except Exception as e:
-        # Fallback to simple heuristic keyword matching
+        # Fallback to simple heuristic keyword matching. The fallback emits
+        # OLLAMA_FALLBACK + OLLAMA_TRIAGE(source="heuristic") itself.
         return _keyword_heuristic(skeleton, user_prompt, str(e))
+
+
+def _truncate_error(error: str, max_len: int = 200) -> str:
+    """Truncate an exception string to ``max_len`` chars, appending "..." when cut."""
+    if len(error) <= max_len:
+        return error
+    return error[: max_len - 3] + "..."
 
 
 def _keyword_heuristic(skeleton: str, user_prompt: str, error: str) -> RoutingResult:
@@ -117,6 +139,7 @@ def _keyword_heuristic(skeleton: str, user_prompt: str, error: str) -> RoutingRe
     - Match on signature content: 1 point
     - Splits camel_case/snake_case identifiers into sub-keywords for better matching
     """
+    start = time.monotonic()
     # Expanded stop words - common English/development words that don't help routing
     stop_words = {
         "the", "and", "for", "that", "with", "this", "change", "modify", "add", "remove",
@@ -165,11 +188,21 @@ def _keyword_heuristic(skeleton: str, user_prompt: str, error: str) -> RoutingRe
     keywords = sorted(keywords)  # noqa
 
     if not keywords:
-        return RoutingResult(
+        result = RoutingResult(
             target_files=[],
             confidence=0.0,
             reasoning=f"Ollama failed ({error}). No keywords extracted from prompt.",
         )
+        logger.log(
+            OLLAMA_FALLBACK,
+            model=triage_model(),
+            error=_truncate_error(error),
+            keywords_count=0,
+            matched_files=0,
+            confidence=result.confidence,
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+        return result
 
     # Parse skeleton into file blocks, count weighted matches
     file_weights: dict[str, int] = {}
@@ -209,11 +242,21 @@ def _keyword_heuristic(skeleton: str, user_prompt: str, error: str) -> RoutingRe
     top_files = [f for f, w in sorted_files if w > 0][:3]
 
     if not top_files:
-        return RoutingResult(
+        result = RoutingResult(
             target_files=[],
             confidence=0.0,
             reasoning=f"Ollama failed ({error}). No files matched any keywords.",
         )
+        logger.log(
+            OLLAMA_FALLBACK,
+            model=triage_model(),
+            error=_truncate_error(error),
+            keywords_count=len(keywords),
+            matched_files=0,
+            confidence=result.confidence,
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+        return result
 
     # Improved confidence calculation:
     # - Normalize by total possible points (3 points per keyword)
@@ -231,8 +274,27 @@ def _keyword_heuristic(skeleton: str, user_prompt: str, error: str) -> RoutingRe
         f"Ranked by weighted keyword matching (file path = 3x, signature = 2x)."
     )
 
-    return RoutingResult(
+    result = RoutingResult(
         target_files=top_files,
         confidence=confidence,
         reasoning=reasoning,
     )
+    logger.log(
+        OLLAMA_FALLBACK,
+        model=triage_model(),
+        error=_truncate_error(error),
+        keywords_count=len(keywords),
+        matched_files=len(top_files),
+        confidence=result.confidence,
+        duration_ms=int((time.monotonic() - start) * 1000),
+    )
+    logger.log(
+        OLLAMA_TRIAGE,
+        model=triage_model(),
+        source="heuristic",
+        confidence=result.confidence,
+        selected_files=top_files,
+        reasoning=result.reasoning,
+        duration_ms=int((time.monotonic() - start) * 1000),
+    )
+    return result

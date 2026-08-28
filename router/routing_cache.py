@@ -13,6 +13,13 @@ import time
 from collections import OrderedDict
 from typing import Callable, Dict, Optional, Tuple
 
+from router.logger import (
+    logger,
+    ROUTING_CACHE_HIT,
+    ROUTING_CACHE_MISS,
+    ROUTING_CACHE_EXPIRED,
+    ROUTING_CACHE_PUT,
+)
 from router.ollama_scorer import RoutingResult
 
 
@@ -42,15 +49,24 @@ class LRURoutingCache:
             entry = self._cache.get(key)
             if entry is not None:
                 self._cache.move_to_end(key)
-            return entry
+            size = len(self._cache)
+            result = entry
+        if result is not None:
+            logger.log(ROUTING_CACHE_HIT, cache="lru", key=key, size=size)
+        else:
+            logger.log(ROUTING_CACHE_MISS, cache="lru", key=key, size=size)
+        return result
 
     def put(self, key: str, value: RoutingResult) -> None:
         """Insert/replace an entry, evicting oldest if over capacity."""
         with self._lock:
             self._cache[key] = value
             self._cache.move_to_end(key)
+            evicted = None
             if len(self._cache) > self._max_entries:
-                self._cache.popitem(last=False)
+                evicted, _ = self._cache.popitem(last=False)
+            size = len(self._cache)
+        logger.log(ROUTING_CACHE_PUT, cache="lru", key=key, size=size, evicted=evicted)
 
     def __len__(self) -> int:
         """Return current number of cached entries (for testing)."""
@@ -107,20 +123,36 @@ class TTLRoutingCache:
         now = time.monotonic()
         ttl = self.ttl_seconds()
         with self._lock:
+            size = len(self._cache)
+            result: Optional[RoutingResult] = None
+            outcome = "miss"
+            age_ms = 0
             entry = self._cache.get(key)
-            if entry is None:
-                return None
-            stored_ts, routing = entry
-            if now - stored_ts > ttl:
-                self._cache.pop(key, None)
-                return None
-            return routing
+            if entry is not None:
+                stored_ts, routing = entry
+                if now - stored_ts > ttl:
+                    self._cache.pop(key, None)
+                    outcome = "expired"
+                    age_ms = int((now - stored_ts) * 1000)
+                    size = len(self._cache)
+                else:
+                    outcome = "hit"
+                    size = len(self._cache)
+                    result = routing
+        if outcome == "hit":
+            logger.log(ROUTING_CACHE_HIT, cache="ttl", key=key, size=size, ttl_seconds=ttl)
+        elif outcome == "expired":
+            logger.log(ROUTING_CACHE_EXPIRED, cache="ttl", key=key, ttl_seconds=ttl, age_ms=age_ms)
+        else:
+            logger.log(ROUTING_CACHE_MISS, cache="ttl", key=key, size=size, ttl_seconds=ttl)
+        return result
 
     def put(self, key: str, value: RoutingResult) -> None:
         """Insert/replace an entry, evicting oldest if over capacity."""
         now = time.monotonic()
         with self._lock:
             self._cache[key] = (now, value)
+            evicted = None
             if len(self._cache) > self._max_entries:
                 # Find the oldest entry by timestamp and evict it
                 oldest_key = min(
@@ -128,6 +160,9 @@ class TTLRoutingCache:
                     key=lambda k: self._cache[k][0],
                 )
                 self._cache.pop(oldest_key, None)
+                evicted = oldest_key
+            size = len(self._cache)
+        logger.log(ROUTING_CACHE_PUT, cache="ttl", key=key, size=size, evicted=evicted)
 
     def __len__(self) -> int:
         """Return current number of cached entries (for testing)."""
