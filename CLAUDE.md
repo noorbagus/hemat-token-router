@@ -140,12 +140,13 @@ Options:
 Gateway credentials loaded from: `/Volumes/Xugab/LAB/PrivateLink/credentials/.env`
 
 - `ANTHROPIC_AUTH_TOKEN` - required
-- Hardcoded gateway config:
-  - `base_url: https://ark.talaga.my.id`
-  - `primary_model: doubao-seed-2.0-lite`
-  - `opus_model: glm-5.3`
+- Hardcoded gateway config (DeepSeek resmi, Anthropic-compatible endpoint):
+  - `base_url: https://api.deepseek.com/anthropic`
+  - `primary_model: deepseek-v4-flash`
+  - `opus_model: deepseek-v4-pro`
   - `fast_model: deepseek-v4-flash`
   - `effort_level: low`
+- Catatan: DeepSeek API key disimpan sebagai `ANTHROPIC_AUTH_TOKEN` di `/Volumes/Xugab/LAB/PrivateLink/.env.local` (bukan `credentials/.env`). Jalur CLI (`cli_dispatch.py`) load kedua file env. Upstream default proxy di-override via env `ANTHROPIC_UPSTREAM_URL`.
 
 ## Aturan untuk AI Coding Tools (CLAUDE.md ini dibaca sebelum edit)
 

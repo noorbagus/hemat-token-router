@@ -32,9 +32,14 @@ from pydantic import BaseModel
 from router.gate import GateResult
 from router.logger import CLI_DISPATCH, logger
 
-# Hardcoded gateway credentials path (unchanged from the old dispatcher).
+# Gateway credentials paths + upstream base URL (env-driven, default DeepSeek).
 GATEWAY_ENV_PATH = "/Volumes/Xugab/LAB/PrivateLink/credentials/.env"
-GATEWAY_BASE_URL = "https://ark.talaga.my.id"
+GATEWAY_ENV_LOCAL_PATH = "/Volumes/Xugab/LAB/PrivateLink/.env.local"
+GATEWAY_BASE_URL = (
+    os.environ.get("ANTHROPIC_UPSTREAM_URL")
+    or os.environ.get("ANTHROPIC_BASE_URL")
+    or "https://api.deepseek.com/anthropic"
+)
 
 
 class DispatchResult(BaseModel):
@@ -123,6 +128,7 @@ def dispatch_claude(
     else:
         # Step 4: load gateway environment + auth token.
         load_dotenv(GATEWAY_ENV_PATH)
+        load_dotenv(GATEWAY_ENV_LOCAL_PATH)
         auth_token = os.getenv("ANTHROPIC_AUTH_TOKEN")
         if not auth_token:
             result = DispatchResult(

@@ -270,7 +270,7 @@ def cmd_start(
 ) -> None:
     """Start the local reverse proxy server."""
     print(f"csmart starting reverse proxy on {host}:{port}")
-    print(f"  Upstream: {os.environ.get('ANTHROPIC_UPSTREAM_URL', 'https://ark.talaga.my.id')}")
+    print(f"  Upstream: {os.environ.get('ANTHROPIC_UPSTREAM_URL', 'https://api.deepseek.com/anthropic')}")
     print(f"  Set ANTHROPIC_BASE_URL=http://{host}:{port} in your shell before running claude")
     print()
     logger.log(
@@ -361,9 +361,9 @@ def main_cli(argv: list[str] | None = None) -> None:
     if args.strict and gate_result.status == "blocked":
         status = "gate_blocked"
         gateway_config = GatewayConfig(
-            base_url=os.getenv("ANTHROPIC_BASE_URL", "https://ark.talaga.my.id"),
-            primary_model=os.getenv("ANTHROPIC_MODEL", "doubao-seed-2.0-lite"),
-            opus_model=os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "glm-5.3"),
+            base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"),
+            primary_model=os.getenv("ANTHROPIC_MODEL", "deepseek-v4-flash"),
+            opus_model=os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "deepseek-v4-pro"),
             fast_model=os.getenv("ANTHROPIC_SMALL_FAST_MODEL", "deepseek-v4-flash"),
             effort_level=os.getenv("CLAUDE_CODE_EFFORT_LEVEL", "low"),
         )
@@ -421,9 +421,9 @@ def main_cli(argv: list[str] | None = None) -> None:
 
     # Step 5: Dispatch to Claude Code CLI
     gateway_config = GatewayConfig(
-        base_url=os.getenv("ANTHROPIC_BASE_URL", "https://ark.talaga.my.id"),
-        primary_model=os.getenv("ANTHROPIC_MODEL", "doubao-seed-2.0-lite"),
-        opus_model=os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "glm-5.3"),
+        base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"),
+        primary_model=os.getenv("ANTHROPIC_MODEL", "deepseek-v4-flash"),
+        opus_model=os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "deepseek-v4-pro"),
         fast_model=os.getenv("ANTHROPIC_SMALL_FAST_MODEL", "deepseek-v4-flash"),
         effort_level=os.getenv("CLAUDE_CODE_EFFORT_LEVEL", "low"),
     )

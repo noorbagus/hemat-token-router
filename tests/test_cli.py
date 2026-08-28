@@ -311,12 +311,18 @@ def test_dispatch_claude_missing_token_logs_error(
     """A missing gateway token must yield exit_code=1 + error in the log record."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "x.py").write_text("def f():\n    pass\n")
-    # Prevent load_dotenv(GATEWAY_ENV_PATH) from re-populating the token.
+    # Prevent load_dotenv(GATEWAY_ENV_PATH / GATEWAY_ENV_LOCAL_PATH) from
+    # re-populating the token.
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.setattr(
         router.cli_dispatch,
         "GATEWAY_ENV_PATH",
         str(tmp_path / "does-not-exist.env"),
+    )
+    monkeypatch.setattr(
+        router.cli_dispatch,
+        "GATEWAY_ENV_LOCAL_PATH",
+        str(tmp_path / "does-not-exist-local.env"),
     )
     gate = GateResult(
         status="blocked",

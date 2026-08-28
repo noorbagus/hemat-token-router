@@ -68,7 +68,7 @@ from router.cli_dispatch import DispatchResult, dispatch_claude, read_file_conte
 # Configuration (environment-driven, defaults mirror proxy.py / CLAUDE.md).
 # ---------------------------------------------------------------------------
 
-UPSTREAM_BASE_URL = os.environ.get("ANTHROPIC_UPSTREAM_URL", "https://ark.talaga.my.id")
+UPSTREAM_BASE_URL = os.environ.get("ANTHROPIC_UPSTREAM_URL", "https://api.deepseek.com/anthropic")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:7b")
 CONFIDENCE_THRESHOLD = float(os.environ.get("CSMART_THRESHOLD", "0.65"))
 DEFAULT_BUDGET_TOKENS = int(os.environ.get("CSMART_BUDGET", "16000"))

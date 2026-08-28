@@ -112,9 +112,9 @@ def test_cmd_stats_aggregates_fixture_reports(tmp_path, capsys) -> None:
     report_dir.mkdir()
 
     gateway = GatewayConfig(
-        base_url="https://ark.talaga.my.id",
-        primary_model="doubao-seed-2.0-lite",
-        opus_model="glm-5.3",
+        base_url="https://api.deepseek.com/anthropic",
+        primary_model="deepseek-v4-flash",
+        opus_model="deepseek-v4-pro",
         fast_model="deepseek-v4-flash",
         effort_level="low",
     )
