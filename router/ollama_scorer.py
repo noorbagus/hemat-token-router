@@ -111,6 +111,8 @@ Respond with JSON only.
             confidence=result.confidence,
             selected_files=result.target_files,
             reasoning=result.reasoning,
+            prompt_eval_count=getattr(response, "prompt_eval_count", None),
+            eval_count=getattr(response, "eval_count", None),
             duration_ms=int((time.monotonic() - start) * 1000),
         )
         return result
