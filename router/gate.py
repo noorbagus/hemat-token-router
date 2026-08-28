@@ -141,3 +141,8 @@ def apply_gate(
         dropped_count=dropped + (len(result.target_files) - len(passing_files)),
         reason=reason,
     )
+
+
+def hook_test_helper() -> int:
+    """Test helper to verify graphify post-commit hook rebuilds the graph."""
+    return 42
