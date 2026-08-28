@@ -77,6 +77,11 @@ MAX_UPSTREAM_RETRIES = 2
 # Shadow loop bound (N-4 / OD-3): at most this many exploration tool_use
 # blocks are held and resolved locally per request.
 MAX_SHADOW_ROUNDS = 3
+# max_tokens floor (issue #1): mirrors the ark Smart Gate clamp
+# (gateway/proxy.py). Below the floor the upstream can cut a tool_use stream
+# mid-JSON, leaving input={} / a partial argument blob that starves the shadow
+# loop into an error-retry loop. Default 4096 (env CSMART_MIN_MAX_TOKENS).
+_DEFAULT_MIN_MAX_TOKENS = 4096
 
 # stdlib logger used for caplog-compatible warnings (inject path-safety).
 _stdlib_logger = logging.getLogger("csmart.proxy")
@@ -111,6 +116,30 @@ def _upstream_timeout() -> float:
         return float(os.environ.get("CSMART_UPSTREAM_TIMEOUT", "60"))
     except ValueError:
         return 60.0
+
+
+def _min_max_tokens() -> int:
+    """Floor for ``max_tokens`` (mirrors ark Smart Gate). Env-overridable."""
+    try:
+        return int(os.environ.get("CSMART_MIN_MAX_TOKENS", str(_DEFAULT_MIN_MAX_TOKENS)))
+    except ValueError:
+        return _DEFAULT_MIN_MAX_TOKENS
+
+
+def _clamp_max_tokens(body: Dict[str, Any]) -> None:
+    """Force ``body["max_tokens"]`` up to the floor, in place.
+
+    Issue #1 fix: below the floor, upstream models (doubao etc.) can truncate a
+    tool_use stream mid-JSON -- ``content_block_start`` carries ``input={}`` and
+    the real arguments only arrive via ``partial_json`` deltas, so a truncated
+    stream leaves the shadow loop with an empty/partial input and a silent
+    error-retry loop. Clamping guarantees adequate budget for tool-calls
+    regardless of the configured upstream.
+    """
+    floor = _min_max_tokens()
+    mt = body.get("max_tokens")
+    if not isinstance(mt, int) or mt < floor:
+        body["max_tokens"] = floor
 
 
 def _context_dir() -> str:
@@ -770,10 +799,52 @@ class _ShadowStreamer:
     async def _execute_held(
         self, held_blocks: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Execute each held exploration tool locally (parallel) and summarize."""
+        """Execute each held exploration tool locally (parallel) and summarize.
+
+        Defensive (issue #1): ``content_block_start`` from upstream models
+        (doubao/glm/deepseek) always carries ``input={}`` and the real
+        arguments arrive only via ``partial_json`` deltas. When those deltas
+        are missing or truncated (empty input, or JSON that never parses), the
+        block is NOT executed -- instead we log the condition explicitly and
+        return an actionable ``tool_result`` so the model can re-issue with
+        explicit arguments instead of silently re-feeding a bare "no path
+        provided" error into a retry loop.
+        """
 
         async def _exec(block: Dict[str, Any]) -> Dict[str, Any]:
             tool_input = self._join_input(block["input_parts"])
+            if not tool_input:
+                logger.log(
+                    TOOL_SHADOW_INTERCEPT,
+                    trace_id=self.trace_id,
+                    tool_name=block["name"],
+                    action_taken="empty_input",
+                )
+                return {
+                    **block,
+                    "input": {},
+                    "content": (
+                        f"ERROR: tool {block['name']!r} received an empty input "
+                        f"(no arguments streamed). Re-issue the call with explicit "
+                        f"arguments (e.g. file_path/path/pattern)."
+                    ),
+                }
+            if "_partial_json" in tool_input:
+                logger.log(
+                    TOOL_SHADOW_INTERCEPT,
+                    trace_id=self.trace_id,
+                    tool_name=block["name"],
+                    action_taken="truncated_input",
+                )
+                return {
+                    **block,
+                    "input": {},
+                    "content": (
+                        f"ERROR: tool {block['name']!r} input was truncated "
+                        f"mid-stream (incomplete JSON). Re-issue the call with "
+                        f"explicit arguments."
+                    ),
+                }
             raw = await execute_local_tool(block["name"], tool_input, self.context_dir)
             logger.log(
                 TOOL_LOCAL_EXEC,
@@ -1008,6 +1079,10 @@ async def handle_messages_request(request: Request) -> Response:
         return JSONResponse({"error": "request_too_large"}, status_code=413)
     except json.JSONDecodeError as exc:
         return JSONResponse({"error": f"invalid json: {exc}"}, status_code=400)
+
+    # Issue #1: clamp max_tokens to a floor so tool-calls aren't truncated
+    # mid-stream (upstream models emit input={} + partial_json deltas).
+    _clamp_max_tokens(body)
 
     trace_id = str(uuid4())
     logger.set_trace_id(trace_id)

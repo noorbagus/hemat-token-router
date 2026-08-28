@@ -7,6 +7,7 @@ upstream: the whole module runs under ``pytest -m "not live"``.
 """
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -108,6 +109,35 @@ def _sse_tool_use_round(name: str, tool_id: str, partial_json: str) -> str:
         'data: {"type":"message_start","message":{"id":"msg_r1","role":"assistant","content":[],"model":"mock"}}',
         "",
         *_sse_tool_use(0, name, tool_id, partial_json).splitlines(),
+        "",
+        "event: message_delta",
+        'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}',
+        "",
+        "event: message_stop",
+        'data: {"type":"message_stop"}',
+        "",
+    ])
+
+
+def _sse_tool_use_empty_input(index: int, name: str, tool_id: str) -> str:
+    """A tool_use block that streams NO input_json deltas (input stays {})."""
+    return "\n".join([
+        "event: content_block_start",
+        f'data: {{"type":"content_block_start","index":{index},"content_block":{{"type":"tool_use","id":"{tool_id}","name":"{name}","input":{{}}}}}}',
+        "",
+        "event: content_block_stop",
+        f'data: {{"type":"content_block_stop","index":{index}}}',
+        "",
+    ])
+
+
+def _sse_tool_use_empty_round(name: str, tool_id: str) -> str:
+    """A full round: message envelope + one tool_use block with empty input."""
+    return "\n".join([
+        "event: message_start",
+        'data: {"type":"message_start","message":{"id":"msg_empty","role":"assistant","content":[],"model":"mock"}}',
+        "",
+        *_sse_tool_use_empty_input(0, name, tool_id).splitlines(),
         "",
         "event: message_delta",
         'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}',
@@ -297,6 +327,97 @@ def test_shadow_rounds_bounded_at_three(mock_upstream, tmp_path, monkeypatch):
     # 3 held (never forwarded) + 2 passed through -> exactly 2 GrepTool blocks.
     assert resp.text.count('"name": "GrepTool"') == 2
     assert "done" in resp.text
+
+
+def test_max_tokens_clamped_to_floor(mock_upstream):
+    """Issue #1: max_tokens below the floor is raised to the floor upstream."""
+    calls = mock_upstream([_sse_text("ok")])
+    body = {
+        "model": "mock-model",
+        "stream": True,
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    resp = _run(_post_messages(body=body))
+
+    assert resp.status_code == 200
+    up_body = json.loads(calls[0].content)
+    assert up_body["max_tokens"] == dispatcher._min_max_tokens()
+
+
+def test_max_tokens_above_floor_preserved(mock_upstream):
+    """Issue #1: max_tokens already at/above the floor is left untouched."""
+    calls = mock_upstream([_sse_text("ok")])
+    body = {
+        "model": "mock-model",
+        "stream": True,
+        "max_tokens": 8192,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    resp = _run(_post_messages(body=body))
+
+    assert resp.status_code == 200
+    up_body = json.loads(calls[0].content)
+    assert up_body["max_tokens"] == 8192
+
+
+def test_max_tokens_defaulted_when_missing(mock_upstream):
+    """Issue #1: absent max_tokens is defaulted to the floor."""
+    calls = mock_upstream([_sse_text("ok")])
+    body = {
+        "model": "mock-model",
+        "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    resp = _run(_post_messages(body=body))
+
+    assert resp.status_code == 200
+    up_body = json.loads(calls[0].content)
+    assert up_body["max_tokens"] == dispatcher._min_max_tokens()
+
+
+def test_empty_tool_input_defensive_error(mock_upstream, tmp_path, monkeypatch):
+    """Issue #1: a tool_use with no streamed args yields an actionable error
+    (action=empty_input), not the silent 'no path provided' retry error."""
+    monkeypatch.setenv("CSMART_CONTEXT_DIR", str(tmp_path))
+    round1 = _sse_tool_use_empty_round("read_file", "tu_empty")
+    round2 = _sse_text("recovered")
+    calls = mock_upstream([round1, round2])
+
+    resp = _run(_post_messages())
+
+    assert resp.status_code == 200
+    assert "recovered" in resp.text
+    assert "tu_empty" not in resp.text  # held, never forwarded to client
+    assert len(calls) == 2
+    followup = json.loads(calls[1].content)
+    results = followup["messages"][-1]["content"]
+    assert results[0]["type"] == "tool_result"
+    assert "empty input" in results[0]["content"]
+    assert "no path provided" not in results[0]["content"]
+
+
+def test_truncated_tool_input_defensive_error(mock_upstream, tmp_path, monkeypatch):
+    """Issue #1: partial_json that never parses is flagged truncated_input."""
+    monkeypatch.setenv("CSMART_CONTEXT_DIR", str(tmp_path))
+    partial = '{"file_path": "router/dis'
+    partial_escaped = partial.replace('"', '\\"')
+    round1 = _sse_tool_use_round("read_file", "tu_partial", partial_escaped)
+    round2 = _sse_text("recovered")
+    calls = mock_upstream([round1, round2])
+
+    resp = _run(_post_messages())
+
+    assert resp.status_code == 200
+    assert "recovered" in resp.text
+    assert len(calls) == 2
+    followup = json.loads(calls[1].content)
+    results = followup["messages"][-1]["content"]
+    assert results[0]["type"] == "tool_result"
+    assert "truncated" in results[0]["content"]
 
 
 def test_routing_runs_once_per_session(mock_upstream, monkeypatch):
