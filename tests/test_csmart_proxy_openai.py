@@ -423,8 +423,10 @@ async def test_e2e_backward_compatibility_anthropic():
 
 
 @pytest.mark.asyncio
-async def test_openai_client_key_not_forwarded():
+async def test_openai_client_key_not_forwarded(monkeypatch):
     """Test that client Authorization header is never forwarded to upstream (same as Anthropic)."""
+    # Pin server-side OpenAI key so the test is hermetic (no real key in assertions)
+    monkeypatch.setattr(cp, "OPENAI_API_KEY", "test-key-never-leaked")
     calls: list[httpx.Request] = []
 
     def capture_handler(request: httpx.Request) -> httpx.Response:
@@ -467,4 +469,244 @@ def test_detect_endpoint_type():
     assert cp.detect_openai_endpoint_type("gpt-4o") == "chat_completions"
     assert cp.detect_openai_endpoint_type("gpt-4o-responses") == "responses"
     assert cp.detect_openai_endpoint_type("responses-model") == "responses"
-    assert cp.detect_openai_endpoint_type("muse-spark-1.2") == "chat_completions"
+    # OpenCode models (muse/opencode) use the Responses API
+    assert cp.detect_openai_endpoint_type("muse-spark-1.2") == "responses"
+    assert cp.detect_openai_endpoint_type("opencode-go/muse-spark-1.2-contributor") == "responses"
+
+
+# -----------------------------------------------------------------------------
+# Responses API SSE transform (REAL wire format: delta is a string)
+# -----------------------------------------------------------------------------
+
+
+def _collect_sse(events: list[tuple[str | None, dict[str, Any]]]) -> list[tuple[str | None, dict[str, Any]]]:
+    """Consume the async transform generator synchronously."""
+    async def _run() -> list[tuple[str | None, dict[str, Any]]]:
+        async def gen():
+            for e in events:
+                yield e
+        out: list[tuple[str | None, dict[str, Any]]] = []
+        async for item in cp.transform_openai_responses_sse_to_anthropic(gen()):
+            out.append(item)
+        return out
+    return asyncio.run(_run())
+
+
+def test_resolve_reasoning_effort():
+    """Anthropic reasoning/thinking config -> Responses API effort (max clamped)."""
+    # explicit effort passthrough
+    assert cp._resolve_reasoning_effort({"reasoning": {"effort": "low"}}) == "low"
+    assert cp._resolve_reasoning_effort({"reasoning": {"effort": "high"}}) == "high"
+    # max is rejected by OpenCode gateway -> clamp to high
+    assert cp._resolve_reasoning_effort({"reasoning": {"effort": "max"}}) == "high"
+    # thinking blocks
+    assert cp._resolve_reasoning_effort({"thinking": {"type": "enabled"}}) == "medium"
+    assert cp._resolve_reasoning_effort({"thinking": {"type": "disabled"}}) == "off"
+    assert cp._resolve_reasoning_effort({"thinking": {"enabled": False}}) == "off"
+    # unknown effort falls back to low
+    assert cp._resolve_reasoning_effort({"reasoning": {"effort": "bogus"}}) == "low"
+    # no signal + no env override -> None (provider default)
+    assert cp._resolve_reasoning_effort({}) is None
+
+
+def test_responses_transform_reasoning_passthrough(monkeypatch):
+    """transform should carry reasoning.effort into the Responses payload."""
+    monkeypatch.setenv("CSMART_REASONING_EFFORT", "")
+    payload = {
+        "model": "muse-spark-1.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning": {"effort": "max"},
+    }
+    result = cp.transform_anthropic_to_openai_responses(payload)
+    assert result["reasoning"] == {"effort": "high"}
+
+
+def test_responses_sse_transform_real_delta_string():
+    """Real Responses API sends delta as STRING. Regression test for the
+    AttributeError: 'str' object has no attribute 'get' crash."""
+    raw_events: list[tuple[str | None, dict[str, Any]]] = [
+        ("response.created", {"type": "response.created"}),
+        ("response.output_text.delta", {"type": "response.output_text.delta", "delta": "READY"}),
+        ("response.output_text.delta", {"type": "response.output_text.delta", "delta": " SET"}),
+        ("response.completed", {"type": "response.completed"}),
+    ]
+    result = _collect_sse(raw_events)
+
+    event_types = [t for t, _ in result]
+    assert event_types == ["message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "message_stop"]
+
+    # Collect all text fragments
+    text = "".join(
+        d["delta"]["text"]
+        for _, d in result
+        if isinstance(d, dict) and d.get("type") == "content_block_delta"
+    )
+    assert text == "READY SET"
+
+
+def test_responses_sse_transform_tool_use():
+    """Responses API function_call: output_item.added -> content_block_start tool_use,
+    function_call_arguments.delta -> input_json, output_item.done -> content_block_stop."""
+    raw_events: list[tuple[str | None, dict[str, Any]]] = [
+        ("response.created", {"type": "response.created"}),
+        (
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "id": "fc_123",
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "Bash",
+                    "arguments": "",
+                    "status": "in_progress",
+                },
+            },
+        ),
+        (
+            "response.function_call_arguments.delta",
+            {"type": "response.function_call_arguments.delta", "delta": '{"command": '},
+        ),
+        (
+            "response.function_call_arguments.delta",
+            {"type": "response.function_call_arguments.delta", "delta": '"ls"}'},
+        ),
+        (
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "id": "fc_123",
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "Bash",
+                    "arguments": '{"command": "ls"}',
+                    "status": "completed",
+                },
+            },
+        ),
+        ("response.completed", {"type": "response.completed"}),
+    ]
+    result = _collect_sse(raw_events)
+
+    event_types = [t for t, _ in result]
+    assert event_types == [
+        "message_start",
+        "content_block_start",   # tool_use
+        "content_block_delta",   # input_json (partial)
+        "content_block_delta",   # input_json (partial)
+        "content_block_stop",    # tool_use done
+        "message_stop",
+    ]
+
+    # Find the tool_use content block start
+    tool_block = next(d for _, d in result if isinstance(d, dict) and d.get("type") == "content_block_start")
+    assert tool_block["content_block"]["type"] == "tool_use"
+    assert tool_block["content_block"]["name"] == "Bash"
+    assert tool_block["content_block"]["id"] == "call_abc"
+
+    # Collect partial input_json fragments
+    json_frag = "".join(
+        d["delta"]["partial_json"]
+        for _, d in result
+        if isinstance(d, dict) and d.get("type") == "content_block_delta"
+    )
+    assert json_frag == '{"command": "ls"}'
+
+
+def test_responses_transform_roundtrip_flattens_tool_calls():
+    """Round-2 tool round-trip must flatten tool_use/tool_result into separate
+    Responses items — NOT a chat-completions ``tool_calls`` field (which the
+    /v1/responses endpoint rejects). Regression for the silent empty-200 bug."""
+    payload: dict[str, Any] = {
+        "model": "opencode-go/muse-spark-1.2-contributor",
+        "max_tokens": 100,
+        "messages": [
+            {"role": "user", "content": "jam berapa sekarang?"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Saya cek."},
+                    {"type": "tool_use", "id": "call_abc", "name": "get_time", "input": {}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call_abc", "content": "14:30"}],
+            },
+        ],
+    }
+    result = cp.transform_anthropic_to_openai_responses(payload)
+    inp = result["input"]
+
+    # No item may carry the chat-completions tool_calls field.
+    assert not any("tool_calls" in item for item in inp)
+
+    # Order mirrors the Anthropic turns: user msg, assistant msg, function_call, function_call_output.
+    assert inp[0] == {"type": "message", "role": "user", "content": "jam berapa sekarang?"}
+    assert inp[1] == {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "Saya cek."}],
+    }
+    fc = [i for i in inp if i.get("type") == "function_call"]
+    assert len(fc) == 1
+    assert fc[0]["call_id"] == "call_abc"
+    assert fc[0]["name"] == "get_time"
+    assert fc[0]["arguments"] == "{}"
+    fco = [i for i in inp if i.get("type") == "function_call_output"]
+    assert len(fco) == 1
+    assert fco[0]["call_id"] == "call_abc"
+    assert fco[0]["output"] == "14:30"
+
+
+def test_responses_sse_transform_forwards_upstream_error():
+    """An upstream error event must surface to the client, not be swallowed into
+    an empty 200 stream (which made the client show no answer)."""
+    raw_events: list[tuple[str | None, dict[str, Any]]] = [
+        (
+            "error",
+            {
+                "type": "error",
+                "error": {"type": "upstream_error", "status_code": 400, "message": "bad tool_calls"},
+            },
+        ),
+    ]
+    result = _collect_sse(raw_events)
+
+    assert len(result) == 1
+    etype, data = result[0]
+    assert etype == "error"
+    assert data["type"] == "error"
+    assert data["error"]["type"] == "upstream_error"
+    assert data["error"]["status_code"] == 400
+    assert "bad tool_calls" in data["error"]["message"]
+
+
+def _reject_upstream(status: int = 400) -> Callable[[httpx.Request], httpx.Response]:
+    """MockTransport handler that rejects with an HTTP error."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text='{"error": {"message": "upstream rejected"}}')
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_e2e_responses_upstream_400_not_swallowed():
+    """End-to-end: upstream 4xx on the Responses path must yield an Anthropic
+    error SSE event — not an empty HTTP 200 stream."""
+    _mock_upstream(_reject_upstream(400))
+
+    payload: dict[str, Any] = {
+        "model": "opencode-go/muse-spark-1.2-contributor",
+        "messages": [{"role": "user", "content": "halo"}],
+        "max_tokens": 100,
+    }
+
+    transport = httpx.ASGITransport(app=cp.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await _post(client, payload)
+
+    assert resp.status_code == 200
+    assert "event: error" in resp.text
+    assert "upstream_error" in resp.text
+    assert "message_stop" not in resp.text

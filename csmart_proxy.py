@@ -34,7 +34,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 try:
     from dotenv import load_dotenv
@@ -72,6 +72,8 @@ UPSTREAM_BASE_URL = (
     or "https://api.deepseek.com/anthropic"
 )
 UPSTREAM_API_KEY = os.getenv("UPSTREAM_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN", "")
+# OpenAI API key is separate (for OpenAI-native endpoints)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PROXY_HOST = os.getenv("CSMART_HOST", "127.0.0.1")
 PROXY_PORT = int(os.getenv("CSMART_PORT", "8080"))
 DB_PATH = os.getenv("CSMART_DB", "csmart_state.db")
@@ -124,7 +126,7 @@ OPENAI_MODEL_PATTERNS = [
 ]
 OPENAI_BASE_URL = os.getenv(
     "CSMART_OPENAI_BASE_URL",
-    os.getenv("OPENAI_BASE_URL", "https://api.opencode.com/v1").rstrip("/")
+    os.getenv("OPENAI_BASE_URL", "https://opencode.ai/zen/go/v1").rstrip("/")
 )
 OPENAI_CHAT_COMPLETIONS_PATH = os.getenv(
     "CSMART_OPENAI_CHAT_PATH", "/chat/completions"
@@ -135,15 +137,18 @@ OPENAI_RESPONSES_PATH = os.getenv(
 
 # System Prompt Steering for OpenAI-native models
 # Instructs model to follow Claude Code tool use format exactly
-SYSTEM_STEERING_PROMPT = """You are a Claude Code agent that follows EXACTLY the Claude Code tool use format:
+SYSTEM_STEERING_PROMPT = """You are a coding assistant in a terminal chat. Follow EXACTLY the Claude Code tool use format:
 - You MUST format tool calls as a JSON array in the tool_use block.
 - You MUST NOT add extra preamble, explanations, or thinking outside the content block.
 - You MUST use the provided tool definitions when the user asks to take action.
 - You MUST follow the input_schema exactly when generating tool_use calls.
+- You MUST NEVER imitate terminal UI or status indicators: no "✻", "Crunched for Ns", "done <time>", "…", spinners, checkmarks, or fake progress text.
+- Always respond directly to the user's message in natural language.
 """
 
-# Logging
-LOG_DIR = os.getenv("CSMART_LOG_DIR", "")
+# Logging — default ke ~/.csmart/logs supaya observability fail-safe (konsisten
+# dengan router/logger.py). CSMART_LOG_DIR tetap bisa override. Nilai tetap di-redact.
+LOG_DIR = os.getenv("CSMART_LOG_DIR", str(Path.home() / ".csmart" / "logs"))
 VERBOSE = os.getenv("CSMART_VERBOSE", "0") == "1"
 
 # =====================================================================
@@ -689,6 +694,15 @@ def route_model_tier(payload: Dict[str, Any], session_key: str) -> str:
 # =====================================================================
 
 
+def clean_openai_model_name(model_name: str) -> str:
+    """Clean model name by removing organization prefix like "opencode-go/".
+    Preserve original for detection but clean for upstream request."""
+    # Strip everything before last slash if present (e.g. "opencode-go/muse" → "muse")
+    if "/" in model_name:
+        return model_name.rsplit("/", 1)[-1]
+    return model_name
+
+
 def is_openai_model(model_name: str) -> bool:
     """Detect if model is OpenAI-native (requires protocol transformation)."""
     lower_name = model_name.lower()
@@ -698,6 +712,9 @@ def is_openai_model(model_name: str) -> bool:
 def detect_openai_endpoint_type(model_name: str) -> str:
     """Detect which OpenAI endpoint to use (chat_completions or responses)."""
     lower_name = model_name.lower()
+    # OpenCode Go instance uses Responses API for all models
+    if "opencode" in lower_name or "muse" in lower_name:
+        return "responses"
     if "response" in lower_name or "responses" in lower_name:
         return "responses"
     # Default to chat completions for most OpenAI models
@@ -716,7 +733,11 @@ def _extract_system_text(system: Any) -> str:
 
 
 def _convert_anthropic_tool_to_openai(anthropic_tool: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert Anthropic tool format (input_schema) → OpenAI tool format (parameters)."""
+    """Convert Anthropic tool format (input_schema) → OpenAI Chat Completions tool format.
+
+    Chat Completions nests everything under ``function``:
+      {"type":"function","function":{"name":...,"parameters":...}}
+    """
     return {
         "type": "function",
         "function": {
@@ -724,6 +745,21 @@ def _convert_anthropic_tool_to_openai(anthropic_tool: Dict[str, Any]) -> Dict[st
             "description": anthropic_tool.get("description", ""),
             "parameters": anthropic_tool.get("input_schema", {}),
         },
+    }
+
+
+def _convert_anthropic_tool_to_openai_responses(anthropic_tool: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert Anthropic tool format → OpenAI Responses API tool format.
+
+    Responses API puts ``name`` at the TOP level (flat), NOT nested under
+    ``function``. Sending Chat Completions format here causes upstream 400:
+    "tools[0] missing required field name".
+    """
+    return {
+        "type": "function",
+        "name": anthropic_tool["name"],
+        "description": anthropic_tool.get("description", ""),
+        "parameters": anthropic_tool.get("input_schema", {}),
     }
 
 
@@ -794,23 +830,145 @@ def transform_anthropic_to_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any
     return openai_payload
 
 
-def transform_anthropic_to_openai_responses(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Transform Anthropic Messages API payload → OpenAI Responses API payload (stub).
+def _convert_anthropic_message_to_openai_responses(
+    anth_msg: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Convert Anthropic message → LIST of OpenAI Responses API input items.
 
-    Can be extended later if Responses API support is needed.
+    Returns a list because an assistant turn with tool_use must become separate
+    ``message`` + ``function_call`` items in the Responses ``input`` array — the
+    chat-completions ``tool_calls`` field is rejected by ``/v1/responses``.
+    Likewise ``tool_result`` becomes a standalone ``function_call_output`` item.
     """
-    # For now, stub implementation — most OpenAI-native models use chat/completions
-    # This can be completed when needed for specific providers
+    role = anth_msg.get("role", "user")
+    content = anth_msg.get("content", "")
+
+    if isinstance(content, str):
+        return [{"type": "message", "role": role, "content": content}]
+
+    # Block format: [{"type":"text","text":...}] or tool_use/tool_result
+    items: List[Dict[str, Any]] = []
+    text_parts: List[str] = []
+
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            txt = block.get("text", "")
+            if txt:
+                text_parts.append(txt)
+        elif btype == "tool_use":
+            items.append({
+                "type": "function_call",
+                "call_id": block.get("id") or f"call_{len(items)}",
+                "name": block.get("name", ""),
+                "arguments": json.dumps(block.get("input", {}), sort_keys=True),
+            })
+        elif btype == "tool_result":
+            # tool_result carries the output of a prior tool_use -> function_call_output
+            tool_use_id = block.get("tool_use_id", "")
+            raw = block.get("content", "")
+            if isinstance(raw, list):
+                raw = "".join(
+                    p.get("text", "") for p in raw if isinstance(p, dict)
+                )
+            items.append({
+                "type": "function_call_output",
+                "call_id": tool_use_id,
+                "output": str(raw),
+            })
+
+    # Emit text FIRST so item order mirrors the Anthropic content order
+    # (text block precedes tool blocks in the original turn).
+    if text_parts:
+        text = "\n".join(text_parts)
+        if role == "assistant":
+            items.insert(0, {
+                "type": "message",
+                "role": role,
+                "content": [{"type": "output_text", "text": text}],
+            })
+        else:
+            items.insert(0, {"type": "message", "role": role, "content": text})
+
+    # Preserve the original turn even when both text and tools are empty.
+    if not items:
+        items.append({"type": "message", "role": role, "content": ""})
+    return items
+
+
+def transform_anthropic_to_openai_responses(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Transform Anthropic Messages API payload → OpenAI Responses API payload.
+
+    Matching OpenCode Go / OpenAI Responses API format.
+    """
     system_text = _extract_system_text(payload.get("system", ""))
+    input_items: List[Dict[str, Any]] = []
+    for m in payload.get("messages", []):
+        # Each Anthropic message flattens to 1..N Responses items (message +
+        # separate function_call / function_call_output items).
+        input_items.extend(_convert_anthropic_message_to_openai_responses(m))
     openai_payload: Dict[str, Any] = {
         "model": payload.get("model"),
         "instructions": system_text,
-        "input": payload.get("messages", []),
+        "input": input_items,
         "stream": True,
     }
     if "max_tokens" in payload:
         openai_payload["max_output_tokens"] = payload["max_tokens"]
+    if "temperature" in payload:
+        openai_payload["temperature"] = payload["temperature"]
+    if "top_p" in payload:
+        openai_payload["top_p"] = payload["top_p"]
+    # Copy tools if present (Anthropic tools → OpenAI Responses tool format:
+    # flat with ``name`` at top level, NOT nested under ``function``).
+    anthropic_tools = payload.get("tools", [])
+    if anthropic_tools:
+        openai_tools = [
+            _convert_anthropic_tool_to_openai_responses(tool) for tool in anthropic_tools
+        ]
+        openai_payload["tools"] = openai_tools
+        openai_payload["parallel_tool_calls"] = True
+    # Map Anthropic reasoning/thinking -> Responses API reasoning effort.
+    # OpenCode gateway only accepts: off / minimal / low / medium / high (rejects "max").
+    effort = _resolve_reasoning_effort(payload)
+    if effort is not None:
+        openai_payload["reasoning"] = {"effort": effort}
     return openai_payload
+
+
+def _resolve_reasoning_effort(payload: Dict[str, Any]) -> Optional[str]:
+    """Resolve Anthropic reasoning/thinking config to an OpenAI Responses effort.
+
+    Order: explicit ``reasoning.effort`` > ``thinking`` block > env default.
+    ``max`` is clamped to ``high`` (OpenCode rejects it). Returns None when no
+    signal is present and no env override is set (provider default applies).
+    """
+    _ALLOWED = ("off", "minimal", "low", "medium", "high")
+
+    def _clamp(effort: Any) -> str:
+        e = str(effort).strip().lower()
+        if e == "max":
+            return "high"
+        return e if e in _ALLOWED else "low"
+
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if effort is not None:
+            return _clamp(effort)
+    thinking = payload.get("thinking")
+    if isinstance(thinking, dict):
+        # thinking.enabled=true + budget_tokens → medium; thinking absent → off
+        if thinking.get("type") == "disabled" or thinking.get("enabled") is False:
+            return "off"
+        if thinking.get("enabled") is True or thinking.get("type") == "enabled":
+            return "medium"
+    env_override = os.getenv("CSMART_REASONING_EFFORT", "").strip().lower()
+    if env_override:
+        return _clamp(env_override)
+    return None
 
 
 async def transform_openai_sse_to_anthropic(
@@ -825,15 +983,22 @@ async def transform_openai_sse_to_anthropic(
     sent_message_start = False
     # Accumulate tool call JSON for streaming
     tool_call_index = 0
+    events_processed = 0
+    text_emitted = 0
+
+    _log("OPENAI_SSE_TRANSFORM_START", status="started")
 
     async for _, openai_event in sse_events:
+        events_processed += 1
         # OpenAI sends [DONE] at end of stream (marked as sentinel dict)
         if openai_event.get("__openai_done"):
+            _log("OPENAI_SSE_TRANSFORM_DONE", events_processed=events_processed, text_emitted=text_emitted)
             yield "message_stop", {"type": "message_stop"}
             break
 
         choices = openai_event.get("choices", [])
         if not choices:
+            _log("OPENAI_SSE_SKIP", reason="no_choices")
             continue
 
         choice = choices[0]
@@ -855,6 +1020,7 @@ async def transform_openai_sse_to_anthropic(
         if "content" in delta and delta["content"] is not None:
             text = delta["content"]
             if text:
+                text_emitted += len(text)
                 yield "content_block_delta", {
                     "type": "content_block_delta",
                     "index": 0,
@@ -884,6 +1050,167 @@ async def transform_openai_sse_to_anthropic(
         if finish_reason is not None:
             yield "message_stop", {"type": "message_stop"}
             break
+
+
+async def transform_openai_responses_sse_to_anthropic(
+    sse_events: AsyncGenerator[Tuple[Optional[str], Dict[str, Any]], None],
+) -> AsyncGenerator[Tuple[Optional[str], Dict[str, Any]], None]:
+    """Transform OpenAI Responses API SSE stream → Anthropic Messages SSE stream.
+
+    OpenCode / OpenAI Responses event types (confirmed live):
+      response.created                     -> message_start
+      response.output_item.added (message) -> message_start (if not yet)
+      response.output_text.delta           -> content_block_delta (text)  <-- primary text stream
+      response.output_item.added (fn_call)-> content_block_start (tool_use)
+      response.function_call_arguments.delta -> content_block_delta (input_json)
+      response.output_item.done (fn_call)  -> content_block_stop (tool_use)
+      response.output_item.done (message)  -> content_block_stop (text, safety)
+      response.completed                   -> message_stop
+      ping / other metadata                -> skipped
+    """
+    sent_message_start = False
+    text_block_started = False
+    text_emitted = 0
+    tool_index = 0  # running index for tool_use content blocks
+
+    _log("OPENAI_RESPONSES_SSE_TRANSFORM", status="started")
+
+    async for event_name, openai_event in sse_events:
+        event_type = event_name
+        if event_type is None:
+            continue
+
+        # ---- upstream failure: never swallow it (would yield an empty 200) ---
+        if event_type == "error":
+            err = openai_event.get("error", {})
+            if not isinstance(err, dict):
+                err = {}
+            _log("UPSTREAM_ERROR",
+                 status_code=err.get("status_code"),
+                 message=str(err.get("message", ""))[:300])
+            yield "error", {
+                "type": "error",
+                "error": {
+                    "type": "upstream_error",
+                    "status_code": err.get("status_code"),
+                    "message": f"csmart upstream error: {err.get('message', 'upstream rejected request')}",
+                },
+            }
+            break
+
+        # ---- lifecycle ---------------------------------------------------
+        if event_type == "response.created":
+            yield "message_start", {
+                "type": "message_start",
+                "message": {"role": "assistant", "content": []},
+            }
+            sent_message_start = True
+            continue
+
+        if event_type == "response.completed":
+            if text_block_started:
+                yield "content_block_stop", {"type": "content_block_stop", "index": 0}
+            yield "message_stop", {"type": "message_stop"}
+            _log("OPENAI_RESPONSES_SSE_TRANSFORM", status="completed", text_emitted=text_emitted)
+            break
+
+        # ---- text streaming (PRIMARY source of assistant text) ------------
+        if event_type == "response.output_text.delta":
+            if not sent_message_start:
+                yield "message_start", {
+                    "type": "message_start",
+                    "message": {"role": "assistant", "content": []},
+                }
+                sent_message_start = True
+            if not text_block_started:
+                yield "content_block_start", {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                }
+                text_block_started = True
+            # Responses API: delta is a STRING ("delta": "text..."), not {"text": ...}.
+            delta = openai_event.get("delta", "")
+            text = delta.get("text", "") if isinstance(delta, dict) else delta
+            if text:
+                text_emitted += len(text)
+                yield "content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text", "text": text},
+                }
+            continue
+
+        # ---- tool call start ---------------------------------------------
+        if event_type == "response.output_item.added":
+            item = openai_event.get("item", {})
+            if item.get("type") == "function_call":
+                tool_index += 1
+                yield "content_block_start", {
+                    "type": "content_block_start",
+                    "index": tool_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": item.get("call_id") or item.get("id") or f"call_{tool_index}",
+                        "name": item.get("name", ""),
+                        "input": {},
+                    },
+                }
+            elif item.get("type") == "message" and not sent_message_start:
+                yield "message_start", {
+                    "type": "message_start",
+                    "message": {"role": "assistant", "content": []},
+                }
+                sent_message_start = True
+            continue
+
+        # ---- tool call args streaming ------------------------------------
+        if event_type == "response.function_call_arguments.delta":
+            args = openai_event.get("delta", "")
+            if args:
+                yield "content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": tool_index,
+                    "delta": {"type": "input_json", "partial_json": args},
+                }
+            continue
+
+        # ---- finalization events ------------------------------------------
+        if event_type == "response.output_item.done":
+            item = openai_event.get("item", {})
+            if item.get("type") == "function_call":
+                yield "content_block_stop", {"type": "content_block_stop", "index": tool_index}
+            elif item.get("type") == "message":
+                # Safety net: if streaming deltas never fired (some providers only
+                # send final content), emit the full text now.
+                if not text_block_started:
+                    content = item.get("content", [])
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "output_text":
+                            txt = part.get("text", "")
+                            if txt:
+                                if not sent_message_start:
+                                    yield "message_start", {
+                                        "type": "message_start",
+                                        "message": {"role": "assistant", "content": []},
+                                    }
+                                    sent_message_start = True
+                                yield "content_block_start", {
+                                    "type": "content_block_start",
+                                    "index": 0,
+                                    "content_block": {"type": "text", "text": ""},
+                                }
+                                text_block_started = True
+                                text_emitted += len(txt)
+                                yield "content_block_delta", {
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": {"type": "text", "text": txt},
+                                }
+            continue
+
+        # ---- everything else (ping, response.in_progress, content_part.*) skipped
+        continue
 
 
 # =====================================================================
@@ -980,6 +1307,100 @@ async def _sse_source(
                 return
             async for event_name, payload in _iter_sse_events(resp):
                 yield event_name, payload
+
+
+def transform_openai_responses_to_anthropic_json(
+    payload: Dict[str, Any], model: str = ""
+) -> Dict[str, Any]:
+    """Transform OpenAI Responses API JSON response → Anthropic Messages JSON response.
+
+    Used for the non-streaming path (Claude Code retry with stream:false).
+    OpenAI Responses output items:
+      {"type":"message","role":"assistant","content":[{"type":"output_text","text":...}]}
+      {"type":"function_call","id":...,"name":...,"arguments":"{...}"}
+    """
+    content: List[Dict[str, Any]] = []
+    stop_reason = "end_turn"
+
+    for item in payload.get("output", []):
+        if not isinstance(item, dict):
+            continue
+        itype = item.get("type")
+        if itype == "message":
+            for part in item.get("content", []) or []:
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    txt = part.get("text", "")
+                    if txt:
+                        content.append({"type": "text", "text": txt})
+        elif itype == "function_call":
+            content.append({
+                "type": "tool_use",
+                "id": item.get("call_id") or item.get("id") or f"call_{len(content)}",
+                "name": item.get("name", ""),
+                "input": _safe_json_loads(item.get("arguments", "")),
+            })
+            stop_reason = "tool_use"
+
+    usage = payload.get("usage", {})
+    anthropic_usage = {
+        "input_tokens": int(usage.get("input_tokens", 0)),
+        "output_tokens": int(usage.get("output_tokens", 0)),
+    }
+    return {
+        "id": f"msg_{payload.get('id', 'resp')[:8]}",
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": model or payload.get("model", ""),
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": anthropic_usage,
+    }
+
+
+def transform_openai_chat_to_anthropic_json(
+    payload: Dict[str, Any], model: str = ""
+) -> Dict[str, Any]:
+    """Transform OpenAI Chat Completions JSON response → Anthropic Messages JSON response."""
+    content: List[Dict[str, Any]] = []
+    stop_reason = "end_turn"
+    choice = (payload.get("choices") or [{}])[0]
+    msg = choice.get("message", {}) or {}
+    if msg.get("content"):
+        content.append({"type": "text", "text": msg["content"]})
+    for tc in msg.get("tool_calls", []) or []:
+        fn = tc.get("function", {}) or {}
+        content.append({
+            "type": "tool_use",
+            "id": tc.get("id") or f"call_{len(content)}",
+            "name": fn.get("name", ""),
+            "input": _safe_json_loads(fn.get("arguments", "")),
+        })
+        stop_reason = "tool_use"
+    usage = payload.get("usage", {}) or {}
+    return {
+        "id": f"msg_{payload.get('id', 'chat')[:8]}",
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": model or payload.get("model", ""),
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": int(usage.get("prompt_tokens", 0)),
+            "output_tokens": int(usage.get("completion_tokens", 0)),
+        },
+    }
+
+
+def _safe_json_loads(raw: Any) -> Any:
+    """Parse JSON string, fall back to {} on failure."""
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        return json.loads(raw) if raw else {}
+    except (TypeError, json.JSONDecodeError):
+        return {}
 
 
 def _format_event(event_name: Optional[str], payload: Dict[str, Any]) -> bytes:
@@ -1281,8 +1702,8 @@ def _upstream_headers(request: Request) -> Dict[str, str]:
     }
 
 
-@app.post("/v1/messages")
-async def handle_messages(request: Request) -> StreamingResponse:
+@app.post("/v1/messages", response_model=None)
+async def handle_messages(request: Request) -> StreamingResponse | JSONResponse:
     global last_request_timestamp, _prefix_snapshot, _active_model
     last_request_timestamp = time.time()
     try:
@@ -1306,6 +1727,14 @@ async def handle_messages(request: Request) -> StreamingResponse:
     original_model = body.get("model", "")
     is_openai = is_openai_model(original_model)
     endpoint_type = detect_openai_endpoint_type(original_model) if is_openai else "anthropic"
+    cleaned_model = clean_openai_model_name(original_model) if is_openai else original_model
+
+    _log("OPENAI_DETECTION",
+        original_model=original_model,
+        cleaned_model=cleaned_model,
+        is_openai=is_openai,
+        endpoint_type=endpoint_type
+    )
 
     # -------------------------------------------------------------------------
     # Step 2: Heuristic model tier routing (flash vs flagship)
@@ -1344,29 +1773,64 @@ async def handle_messages(request: Request) -> StreamingResponse:
     body = align_prefix_3_region(body)
     _prefix_snapshot = {"system": body.get("system", []), "tools": body.get("tools", [])}
 
-    _log("INBOUND_REQUEST", model=routed_model, session=session_key, messages=len(body.get("messages", [])))
+    _system_text = _extract_system_text(body.get("system", []))
+    _log(
+        "INBOUND_REQUEST",
+        model=routed_model,
+        session=session_key,
+        messages=len(body.get("messages", [])),
+        system_chars=len(_system_text),
+        tools_count=len(body.get("tools", [])),
+        is_openai=is_openai,
+    )
 
     if is_openai:
         # OpenAI endpoints don't need anthropic-version header
+        # Use separate OPENAI_API_KEY for OpenAI-native endpoints
         headers = {
-            "Authorization": f"Bearer {UPSTREAM_API_KEY}",
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
             "Content-Type": "application/json",
         }
         # Select endpoint and transform request
         if endpoint_type == "chat_completions":
             upstream_url = f"{OPENAI_BASE_URL}{OPENAI_CHAT_COMPLETIONS_PATH}"
             transformed_body = transform_anthropic_to_openai_chat(body)
+            transformed_body["model"] = cleaned_model
         elif endpoint_type == "responses":
             upstream_url = f"{OPENAI_BASE_URL}{OPENAI_RESPONSES_PATH}"
             transformed_body = transform_anthropic_to_openai_responses(body)
+            transformed_body["model"] = cleaned_model
         else:
             upstream_url = f"{OPENAI_BASE_URL}{OPENAI_CHAT_COMPLETIONS_PATH}"
             transformed_body = transform_anthropic_to_openai_chat(body)
+            transformed_body["model"] = cleaned_model
+
+        _log("OPENAI_REQUEST_TRANSFORM",
+            upstream_url=upstream_url,
+            endpoint_type=endpoint_type,
+            input_model=original_model,
+            output_model=cleaned_model,
+            input_messages=len(body.get("messages", [])),
+            output_messages=(
+                len(transformed_body.get("messages", []))
+                if endpoint_type == "chat_completions"
+                else len(transformed_body.get("input", []))
+            )
+        )
     else:
         # Anthropic native endpoint includes anthropic-version header
         headers = _upstream_headers(request)
         upstream_url = f"{UPSTREAM_BASE_URL}/v1/messages"
         transformed_body = body
+
+    # Debug: dump the exact upstream request once per env flag (CSMART_DUMP_BODY=1)
+    if os.getenv("CSMART_DUMP_BODY") == "1":
+        try:
+            with open("/tmp/csmart-body-dump.json", "w") as _f:
+                json.dump({"url": upstream_url, "body": transformed_body}, _f, indent=2)
+            _log("BODY_DUMPED", path="/tmp/csmart-body-dump.json", url=upstream_url)
+        except Exception:
+            pass
 
     # -------------------------------------------------------------------------
     # Step 3: Response transformation (OpenAI -> Anthropic format)
@@ -1375,7 +1839,7 @@ async def handle_messages(request: Request) -> StreamingResponse:
         redactor = StreamingRedactor()
 
         if is_openai and endpoint_type == "chat_completions":
-            # For OpenAI chat completions: we need to transform SSE format
+            # For OpenAI chat completions: transform SSE format
             async for _event_name, anthropic_event in transform_openai_sse_to_anthropic(
                 _sse_source("POST", upstream_url, headers, transformed_body)
             ):
@@ -1386,9 +1850,20 @@ async def handle_messages(request: Request) -> StreamingResponse:
             final = redactor.flush()
             if final:
                 yield final.encode("utf-8")
+        elif is_openai and endpoint_type == "responses":
+            # For OpenAI Responses API: special transform SSE format
+            async for _event_name, anthropic_event in transform_openai_responses_sse_to_anthropic(
+                _sse_source("POST", upstream_url, headers, transformed_body)
+            ):
+                event_bytes = _format_event(_event_name, anthropic_event)
+                out = redactor.feed(event_bytes.decode("utf-8", errors="replace"))
+                if out:
+                    yield out.encode("utf-8")
+            final = redactor.flush()
+            if final:
+                yield final.encode("utf-8")
         else:
-            # Anthropic native (or OpenAI responses with future support):
-            # use existing ProxyStreamer which handles CCR/shadowing
+            # Anthropic native: use existing ProxyStreamer which handles CCR/shadowing
             streamer = ProxyStreamer("POST", upstream_url, headers, transformed_body)
             async for chunk in streamer.run():
                 out = redactor.feed(chunk.decode("utf-8", errors="replace"))
@@ -1397,6 +1872,39 @@ async def handle_messages(request: Request) -> StreamingResponse:
             final = redactor.flush()
             if final:
                 yield final.encode("utf-8")
+
+    # -------------------------------------------------------------------------
+    # Step 4: Non-streaming path (Claude Code retries with stream:false when the
+    # streaming attempt returns no events). Return a proper JSON response —
+    # NOT an event-stream — otherwise Claude Code reports "malformed response".
+    # -------------------------------------------------------------------------
+    if body.get("stream") is False:
+        _log("NON_STREAMING_REQUEST", endpoint_type=endpoint_type, model=cleaned_model)
+        try:
+            transformed_body["stream"] = False
+            payload_bytes = json.dumps(transformed_body, sort_keys=True).encode("utf-8")
+            async with httpx.AsyncClient(
+                transport=_UPSTREAM_TRANSPORT, timeout=UPSTREAM_TIMEOUT
+            ) as client:
+                resp = await client.post(upstream_url, headers=headers, content=payload_bytes)
+                resp_json = resp.json()
+            if resp.status_code >= 400:
+                _log("NON_STREAMING_UPSTREAM_ERROR", status=resp.status_code)
+                raise HTTPException(status_code=502, detail=f"Upstream error: {resp.status_code}")
+
+            if is_openai and endpoint_type == "responses":
+                anthropic_json = transform_openai_responses_to_anthropic_json(resp_json, cleaned_model)
+            elif is_openai and endpoint_type == "chat_completions":
+                anthropic_json = transform_openai_chat_to_anthropic_json(resp_json, cleaned_model)
+            else:
+                anthropic_json = resp_json
+            _log("NON_STREAMING_RESPONSE", content_blocks=len(anthropic_json.get("content", [])))
+            return JSONResponse(anthropic_json)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _log("NON_STREAMING_ERROR", error=str(exc)[:200])
+            raise HTTPException(status_code=502, detail=f"Non-streaming upstream failed: {exc}")
 
     return StreamingResponse(
         generator(),
