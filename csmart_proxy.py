@@ -113,6 +113,35 @@ _COMPLEX_TRIGGERS = [
     if t.strip()
 ]
 
+# OpenAI-native model detection and endpoints
+OPENAI_MODEL_PATTERNS = [
+    t.strip()
+    for t in os.getenv(
+        "CSMART_OPENAI_PATTERNS",
+        "gpt-,o1-,o3-,muse-,opencode-,text-,davinci-,curie-",
+    ).split(",")
+    if t.strip()
+]
+OPENAI_BASE_URL = os.getenv(
+    "CSMART_OPENAI_BASE_URL",
+    os.getenv("OPENAI_BASE_URL", "https://api.opencode.com/v1").rstrip("/")
+)
+OPENAI_CHAT_COMPLETIONS_PATH = os.getenv(
+    "CSMART_OPENAI_CHAT_PATH", "/chat/completions"
+)
+OPENAI_RESPONSES_PATH = os.getenv(
+    "CSMART_OPENAI_RESPONSES_PATH", "/responses"
+)
+
+# System Prompt Steering for OpenAI-native models
+# Instructs model to follow Claude Code tool use format exactly
+SYSTEM_STEERING_PROMPT = """You are a Claude Code agent that follows EXACTLY the Claude Code tool use format:
+- You MUST format tool calls as a JSON array in the tool_use block.
+- You MUST NOT add extra preamble, explanations, or thinking outside the content block.
+- You MUST use the provided tool definitions when the user asks to take action.
+- You MUST follow the input_schema exactly when generating tool_use calls.
+"""
+
 # Logging
 LOG_DIR = os.getenv("CSMART_LOG_DIR", "")
 VERBOSE = os.getenv("CSMART_VERBOSE", "0") == "1"
@@ -656,6 +685,208 @@ def route_model_tier(payload: Dict[str, Any], session_key: str) -> str:
 
 
 # =====================================================================
+# 5.1 OPENAI NATIVE MODEL SUPPORT — Protocol Transformation
+# =====================================================================
+
+
+def is_openai_model(model_name: str) -> bool:
+    """Detect if model is OpenAI-native (requires protocol transformation)."""
+    lower_name = model_name.lower()
+    return any(pattern.lower() in lower_name for pattern in OPENAI_MODEL_PATTERNS)
+
+
+def detect_openai_endpoint_type(model_name: str) -> str:
+    """Detect which OpenAI endpoint to use (chat_completions or responses)."""
+    lower_name = model_name.lower()
+    if "response" in lower_name or "responses" in lower_name:
+        return "responses"
+    # Default to chat completions for most OpenAI models
+    return "chat_completions"
+
+
+def _extract_system_text(system: Any) -> str:
+    """Extract concatenated system text from Anthropic system format (str or list)."""
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        return " ".join(
+            block.get("text", "") for block in system if isinstance(block, dict)
+        )
+    return str(system)
+
+
+def _convert_anthropic_tool_to_openai(anthropic_tool: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert Anthropic tool format (input_schema) → OpenAI tool format (parameters)."""
+    return {
+        "type": "function",
+        "function": {
+            "name": anthropic_tool["name"],
+            "description": anthropic_tool.get("description", ""),
+            "parameters": anthropic_tool.get("input_schema", {}),
+        },
+    }
+
+
+def _convert_anthropic_message_to_openai(anth_msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert Anthropic message format → OpenAI Chat Completions message."""
+    role = anth_msg.get("role", "user")
+    content = anth_msg.get("content", "")
+
+    # Anthropic content is either str or list[blocks]
+    if isinstance(content, str):
+        text_content = content
+    elif isinstance(content, list):
+        # Concatenate all text blocks (ignore non-text for now)
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text" and "text" in block:
+                    text_parts.append(block["text"])
+        text_content = "".join(text_parts)
+    else:
+        text_content = str(content)
+
+    return {"role": role, "content": text_content}
+
+
+def transform_anthropic_to_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Transform Anthropic Messages API payload → OpenAI Chat Completions API payload."""
+    # Extract system prompt
+    system_text = _extract_system_text(payload.get("system", ""))
+
+    # Convert all messages
+    messages: List[Dict[str, Any]] = []
+
+    # Add system message first if non-empty
+    if system_text.strip():
+        messages.append({"role": "system", "content": system_text})
+
+    # Add conversation messages
+    for anth_msg in payload.get("messages", []):
+        if isinstance(anth_msg, dict):
+            messages.append(_convert_anthropic_message_to_openai(anth_msg))
+
+    # Build OpenAI payload
+    openai_payload: Dict[str, Any] = {
+        "model": payload.get("model"),
+        "messages": messages,
+        "stream": True,
+    }
+
+    # Copy optional parameters if present
+    if "max_tokens" in payload:
+        openai_payload["max_tokens"] = payload["max_tokens"]
+    if "temperature" in payload:
+        openai_payload["temperature"] = payload["temperature"]
+    if "top_p" in payload:
+        openai_payload["top_p"] = payload["top_p"]
+
+    # Convert tools if present
+    anthropic_tools = payload.get("tools", [])
+    if anthropic_tools:
+        openai_tools = [
+            _convert_anthropic_tool_to_openai(tool) for tool in anthropic_tools
+        ]
+        openai_payload["tools"] = openai_tools
+        # Enable parallel tool calls by default (Anthropic-like behavior)
+        openai_payload["parallel_tool_calls"] = True
+
+    return openai_payload
+
+
+def transform_anthropic_to_openai_responses(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Transform Anthropic Messages API payload → OpenAI Responses API payload (stub).
+
+    Can be extended later if Responses API support is needed.
+    """
+    # For now, stub implementation — most OpenAI-native models use chat/completions
+    # This can be completed when needed for specific providers
+    system_text = _extract_system_text(payload.get("system", ""))
+    openai_payload: Dict[str, Any] = {
+        "model": payload.get("model"),
+        "instructions": system_text,
+        "input": payload.get("messages", []),
+        "stream": True,
+    }
+    if "max_tokens" in payload:
+        openai_payload["max_output_tokens"] = payload["max_tokens"]
+    return openai_payload
+
+
+async def transform_openai_sse_to_anthropic(
+    sse_events: AsyncGenerator[Tuple[Optional[str], Dict[str, Any]], None],
+) -> AsyncGenerator[Tuple[Optional[str], Dict[str, Any]], None]:
+    """Transform OpenAI Chat Completions SSE stream → Anthropic Messages SSE stream.
+
+    OpenAI: data: {"choices": [{"delta": {"content": "..."}}]}
+    Anthropic: event: content_block_delta\ndata: {"type": "content_block_delta", "delta": {"text": "..."}}\n\n
+    """
+    # Track if we've sent message_start yet
+    sent_message_start = False
+    # Accumulate tool call JSON for streaming
+    tool_call_index = 0
+
+    async for _, openai_event in sse_events:
+        # OpenAI sends [DONE] at end of stream (marked as sentinel dict)
+        if openai_event.get("__openai_done"):
+            yield "message_stop", {"type": "message_stop"}
+            break
+
+        choices = openai_event.get("choices", [])
+        if not choices:
+            continue
+
+        choice = choices[0]
+        delta = choice.get("delta", {})
+        finish_reason = choice.get("finish_reason")
+
+        # Send message_start on first chunk
+        if not sent_message_start:
+            yield "message_start", {
+                "type": "message_start",
+                "message": {
+                    "role": "assistant",
+                    "content": [],
+                },
+            }
+            sent_message_start = True
+
+        # Handle text content delta
+        if "content" in delta and delta["content"] is not None:
+            text = delta["content"]
+            if text:
+                yield "content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text", "text": text},
+                }
+
+        # Handle tool call delta (streaming tool calls)
+        if "tool_calls" in delta and delta["tool_calls"] is not None:
+            for tool_call_delta in delta["tool_calls"]:
+                # OpenAI streams tool_calls[].function.arguments incrementally
+                if "function" in tool_call_delta and "arguments" in tool_call_delta["function"]:
+                    args = tool_call_delta["function"]["arguments"]
+                    if args:
+                        yield "content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": 1 + tool_call_index,
+                            "delta": {
+                                "type": "input_json",
+                                "partial_json": args,
+                            },
+                        }
+                if "name" in tool_call_delta:
+                    # New tool call starts here — increment index
+                    tool_call_index += 1
+
+        # End of stream
+        if finish_reason is not None:
+            yield "message_stop", {"type": "message_stop"}
+            break
+
+
+# =====================================================================
 # 6. STREAMING REDACTOR (split-marker-safe unmask)
 # =====================================================================
 _MARKER_RE = re.compile(r"__CSMART_SEC_[0-9a-f]{8}__")
@@ -690,6 +921,11 @@ class StreamingRedactor:
 # =====================================================================
 def _parse_sse_data(data_lines: List[str]) -> Dict[str, Any]:
     raw = "\n".join(data_lines)
+    raw_stripped = raw.strip()
+    # Special case for OpenAI end-of-stream marker
+    if raw_stripped == "[DONE]":
+        # Use a sentinel dict that transform_openai_sse_to_anthropic recognizes
+        return {"__openai_done": True}
     try:
         payload = json.loads(raw)
         if isinstance(payload, dict):
@@ -1062,27 +1298,105 @@ async def handle_messages(request: Request) -> StreamingResponse:
 
     body = clamp_max_tokens(body)
     sanitize_payload(body)
-    body = align_prefix_3_region(body)
-    _prefix_snapshot = {"system": body.get("system", []), "tools": body.get("tools", [])}
 
+    # -------------------------------------------------------------------------
+    # Step 1: Detect OpenAI models BEFORE model tier routing overrides name
+    # OpenAI detection is based on original model name from client request
+    # -------------------------------------------------------------------------
+    original_model = body.get("model", "")
+    is_openai = is_openai_model(original_model)
+    endpoint_type = detect_openai_endpoint_type(original_model) if is_openai else "anthropic"
+
+    # -------------------------------------------------------------------------
+    # Step 2: Heuristic model tier routing (flash vs flagship)
+    # -------------------------------------------------------------------------
     routed_model = route_model_tier(body, session_key)
     _active_model = routed_model
     body["model"] = routed_model
+
+    # -------------------------------------------------------------------------
+    # Step 3: System Prompt Steering for OpenAI-native models
+    # Inject before 3-region alignment so steering is part of the immutable prefix
+    # -------------------------------------------------------------------------
+    if is_openai:
+        # Inject steering prompt into system (based on original detection)
+        steering_block = {"type": "text", "text": SYSTEM_STEERING_PROMPT}
+        current_system = body.get("system", "")
+        if isinstance(current_system, str):
+            # Convert string to list format and append
+            if current_system.strip():
+                body["system"] = [
+                    {"type": "text", "text": current_system},
+                    steering_block,
+                ]
+            else:
+                body["system"] = [steering_block]
+        elif isinstance(current_system, list):
+            # Already list format, append
+            body["system"] = current_system + [steering_block]
+        else:
+            # Fallback: convert to string and append
+            body["system"] = f"{_extract_system_text(current_system)}\n\n{SYSTEM_STEERING_PROMPT}"
+
+    # -------------------------------------------------------------------------
+    # 3-region prefix alignment (includes steering now for cache stability)
+    # -------------------------------------------------------------------------
+    body = align_prefix_3_region(body)
+    _prefix_snapshot = {"system": body.get("system", []), "tools": body.get("tools", [])}
+
     _log("INBOUND_REQUEST", model=routed_model, session=session_key, messages=len(body.get("messages", [])))
 
-    headers = _upstream_headers(request)
-    upstream_url = f"{UPSTREAM_BASE_URL}/v1/messages"
+    if is_openai:
+        # OpenAI endpoints don't need anthropic-version header
+        headers = {
+            "Authorization": f"Bearer {UPSTREAM_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        # Select endpoint and transform request
+        if endpoint_type == "chat_completions":
+            upstream_url = f"{OPENAI_BASE_URL}{OPENAI_CHAT_COMPLETIONS_PATH}"
+            transformed_body = transform_anthropic_to_openai_chat(body)
+        elif endpoint_type == "responses":
+            upstream_url = f"{OPENAI_BASE_URL}{OPENAI_RESPONSES_PATH}"
+            transformed_body = transform_anthropic_to_openai_responses(body)
+        else:
+            upstream_url = f"{OPENAI_BASE_URL}{OPENAI_CHAT_COMPLETIONS_PATH}"
+            transformed_body = transform_anthropic_to_openai_chat(body)
+    else:
+        # Anthropic native endpoint includes anthropic-version header
+        headers = _upstream_headers(request)
+        upstream_url = f"{UPSTREAM_BASE_URL}/v1/messages"
+        transformed_body = body
 
+    # -------------------------------------------------------------------------
+    # Step 3: Response transformation (OpenAI -> Anthropic format)
+    # -------------------------------------------------------------------------
     async def generator() -> AsyncGenerator[bytes, None]:
         redactor = StreamingRedactor()
-        streamer = ProxyStreamer("POST", upstream_url, headers, body)
-        async for chunk in streamer.run():
-            out = redactor.feed(chunk.decode("utf-8", errors="replace"))
-            if out:
-                yield out.encode("utf-8")
-        final = redactor.flush()
-        if final:
-            yield final.encode("utf-8")
+
+        if is_openai and endpoint_type == "chat_completions":
+            # For OpenAI chat completions: we need to transform SSE format
+            async for _event_name, anthropic_event in transform_openai_sse_to_anthropic(
+                _sse_source("POST", upstream_url, headers, transformed_body)
+            ):
+                event_bytes = _format_event(_event_name, anthropic_event)
+                out = redactor.feed(event_bytes.decode("utf-8", errors="replace"))
+                if out:
+                    yield out.encode("utf-8")
+            final = redactor.flush()
+            if final:
+                yield final.encode("utf-8")
+        else:
+            # Anthropic native (or OpenAI responses with future support):
+            # use existing ProxyStreamer which handles CCR/shadowing
+            streamer = ProxyStreamer("POST", upstream_url, headers, transformed_body)
+            async for chunk in streamer.run():
+                out = redactor.feed(chunk.decode("utf-8", errors="replace"))
+                if out:
+                    yield out.encode("utf-8")
+            final = redactor.flush()
+            if final:
+                yield final.encode("utf-8")
 
     return StreamingResponse(
         generator(),
