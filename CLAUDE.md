@@ -270,10 +270,23 @@ Kebiasaan wajib:
 
 **Rule: kalau project punya `graphify-out/graph.json`, baca graph DULU sebelum baca file source.**
 
+### Perintah inti (urutan)
+
+```bash
+graphify god-nodes                          # 1. hub utama arsitektur
+graphify explain "<node>"                   # 2. detail tiap hub (source, neighbors)
+graphify path "<modulA>" "<modulB>"         # 3. alur antar modul
+graphify query "<pertanyaan>"               # 4. tanya spesifik
+```
+
+Kalau graph belum ada: `graphify update .` (build graph, no LLM, code-only).
+
+### Aturan
+
 1. **Cek graph ada**: `[ -f graphify-out/graph.json ]` → kalau tidak ada, skip ke flow normal.
-2. **Orientasi arsitektur**: `graphify god-nodes` + `graphify explain "<file>"`
-3. **Sebelum baca file source**, query graph dulu: `graphify query "<pertanyaan>"` / `graphify path "<A>" "<B>"` / `graphify explain "<symbol>"`
-4. **Read file source HANYA setelah** graph menunjuk file relevan.
+2. `explain` ambigu (label duplikat) → pakai **node id** (dari output `explain`), jangan tebak.
+3. Catat `source_file:L` + tag `[EXTRACTED]`/`[INFERRED]` untuk tiap klaim. Node di `tests/` = test, bukan production.
+4. **Read file source HANYA setelah** graph menunjuk file relevan — baca di line yang ditunjuk, bukan file utuh.
 
 **Larangan:** jangan baca `graph.json` mentah (ledakkan context); jangan baca semua file untuk "paham konteks".
 
