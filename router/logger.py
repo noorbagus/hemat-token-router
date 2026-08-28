@@ -6,6 +6,7 @@ Contract: CONTRACTS.md §2 (Track D). Wave 2 consumes the module singleton via
 
 from __future__ import annotations
 
+import contextvars
 import json
 import queue
 import sys
@@ -21,6 +22,28 @@ OLLAMA_TRIAGE = "OLLAMA_TRIAGE"
 TOOL_SHADOW_INTERCEPT = "TOOL_SHADOW_INTERCEPT"
 TOOL_LOCAL_EXEC = "TOOL_LOCAL_EXEC"
 SSE_STREAM_COMPLETE = "SSE_STREAM_COMPLETE"
+
+# Source-level events (added Wave 3 — each service function logs at its own
+# decision point so AI tooling can trace the full pipeline). Exact strings,
+# pinned by test_logger.py::test_new_event_constants_exact.
+AST_CACHE_HIT = "AST_CACHE_HIT"
+ROUTING_CACHE_HIT = "ROUTING_CACHE_HIT"
+ROUTING_CACHE_MISS = "ROUTING_CACHE_MISS"
+ROUTING_CACHE_EXPIRED = "ROUTING_CACHE_EXPIRED"
+ROUTING_CACHE_PUT = "ROUTING_CACHE_PUT"
+OLLAMA_FALLBACK = "OLLAMA_FALLBACK"
+GATE_APPLIED = "GATE_APPLIED"
+IMPORT_EXPANSION = "IMPORT_EXPANSION"
+CONTEXT_INJECTED = "CONTEXT_INJECTED"
+TOOL_SUMMARIZE = "TOOL_SUMMARIZE"
+CLI_DISPATCH = "CLI_DISPATCH"
+SERVER_START = "SERVER_START"
+SERVER_STOP = "SERVER_STOP"
+# Operational events (proxy health / passthrough / retries).
+PASSTHROUGH = "PASSTHROUGH"
+UPSTREAM_HEALTH = "UPSTREAM_HEALTH"
+OLLAMA_HEALTH = "OLLAMA_HEALTH"
+UPSTREAM_RETRY = "UPSTREAM_RETRY"
 
 # Field keys (case-insensitive) whose values are redacted before logging.
 _SENSITIVE_KEYS = frozenset({"authorization", "api_key", "x-api-key", "token"})
@@ -51,10 +74,16 @@ class StructuredLogger:
         self._queue: queue.Queue[dict[str, object] | None] = queue.Queue(maxsize=_QUEUE_MAXSIZE)
         self._file: TextIO = self._log_path.open("a", encoding="utf-8")
         self._file_lock = threading.Lock()
-        self._trace_lock = threading.Lock()
         self._close_lock = threading.Lock()
-        self._trace_id: str | None = None
         self._closed: bool = False
+
+        # Per-task trace id, not global mutable state: uvicorn runs one request
+        # per task, and asyncio.to_thread propagates context into worker threads,
+        # so a trace set in handle_messages_request stays attached to every
+        # source-level event of that turn (fixes MAJOR race — TASKS.md).
+        self._trace_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+            "csmart_trace_id", default=None
+        )
 
         self._writer = threading.Thread(
             target=self._writer_loop, name="csmart-logger", daemon=True
@@ -81,9 +110,12 @@ class StructuredLogger:
             self._write_drop_line()
 
     def set_trace_id(self, trace_id: str) -> None:
-        """Store the per-turn trace id stamped onto subsequent records."""
-        with self._trace_lock:
-            self._trace_id = trace_id
+        """Store the per-turn trace id stamped onto subsequent records.
+
+        The id lives in a :class:`contextvars.ContextVar`, so it is scoped to
+        the calling async task and its worker threads rather than process-wide.
+        """
+        self._trace_var.set(trace_id)
 
     def redact(self, value: str) -> str:
         """Mask a sensitive value. Always returns the fixed placeholder."""
@@ -156,8 +188,7 @@ class StructuredLogger:
             print("csmart-logger: queue full, dropped record", file=sys.stderr)
 
     def _get_trace_id(self) -> str | None:
-        with self._trace_lock:
-            return self._trace_id
+        return self._trace_var.get()
 
     @staticmethod
     def _json_safe(value: object) -> object:
