@@ -4,16 +4,12 @@
     "deny": [
       "Read(~/.ssh/**)",
       "Edit(~/.ssh/**)",
-      "Write(~/.ssh/**)",
       "Read(~/.aws/**)",
       "Edit(~/.aws/**)",
-      "Write(~/.aws/**)",
       "Read(~/.config/gcloud/**)",
       "Edit(~/.config/gcloud/**)",
-      "Write(~/.config/gcloud/**)",
       "Read(~/.kube/**)",
       "Edit(~/.kube/**)",
-      "Write(~/.kube/**)",
       "Read(~/.netrc)",
       "Read(~/.git-credentials)",
       "Read(~/.npmrc)",
@@ -33,27 +29,5 @@
       "Bash(git status:*)",
       "Bash(git diff:*)"
     ]
-  },
-  "sandbox": {
-    "mode": "allowSome",
-    "network": {
-      "mode": "allowSome",
-      "allowedDomains": [
-        "api.deepseek.com"
-      ]
-    },
-    "filesystem": {
-      "readRoots": ["."],
-      "writeRoots": ["."]
-    },
-    "credentials": {
-      "mask": [
-        "API_KEY",
-        "UPSTREAM_BASE_URL",
-        "UPSTREAM_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "GITHUB_TOKEN"
-      ]
-    }
   }
 }

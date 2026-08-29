@@ -87,6 +87,16 @@ fi
 
 # ---- 5. Jalankan Claude Code (pass CLI args) --------------------------------
 echo "run.sh: proxy siap di ${HEALTH_URL} — menjalankan claude $*"
-# Foreground (bukan exec) agar trap EXIT di atas tetap jalan setelah claude
-# keluar dan memastikan proxy csmart ikut di-kill (tidak bocor).
+# Install deny-rules (G5) ke ~/.claude agar aktif tiap run (tahan rebuild).
+mkdir -p "$HOME/.claude"
+if [[ -f "$PWD/sandbox/settings.json" ]]; then
+  cp "$PWD/sandbox/settings.json" "$HOME/.claude/settings.json"
+fi
+
+# unsandboxed: container pakai --cap-drop=ALL jadi bubblewrap tidak bisa jalan.
+# Override SCRUB=1 dari devcontainer.json agar claude tidak menuntut bwrap.
+export CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0
+
+# Foreground (bukan exec) agar trap EXIT tetap jalan setelah claude keluar
+# dan memastikan proxy csmart ikut di-kill (tidak bocor).
 claude "$@"
