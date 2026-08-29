@@ -11,6 +11,9 @@ Exposes two async entrypoints:
   before touching the filesystem (anti path-traversal, QG-03 groundwork).
 * :func:`summarize_exploration` optionally condenses large raw tool output via
   Ollama (``qwen2.5-coder:7b`` by default), keeping short outputs untouched.
+  Reader-tool output (``View``, ``read_file``, ``FileRead``) is source code and
+  passes through verbatim instead of being summarized (see the function's
+  docstring).
 
 All filesystem work runs in a worker thread via ``asyncio.to_thread`` so the
 caller's event loop is never blocked.
@@ -21,10 +24,12 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from pathlib import Path
 
 import ollama
 
+from router.logger import TOOL_LOCAL_EXEC, TOOL_SUMMARIZE, logger
 from router.safe_path import PathTraversalError, resolve_under_base
 
 __all__ = [
@@ -215,26 +220,34 @@ def _normalize_tool_name(tool_name: str) -> str:
 
 def _execute_local_tool_sync(tool_name: str, tool_input: dict, base_dir: Path) -> str:
     """Synchronous dispatch; executed in a worker thread by the async wrapper."""
+    start = time.monotonic()
     tool_input = tool_input or {}
     name = _normalize_tool_name(tool_name)
 
     if name in _READER_TOOLS:
         path_str = _get_path(tool_input, ("file_path", "path", "directory"))
         if path_str is None:
-            return f"ERROR: no path provided for {tool_name}"
-        return _run_view(path_str, base_dir)
-
-    if name == "LS":
+            result = f"ERROR: no path provided for {tool_name}"
+        else:
+            result = _run_view(path_str, base_dir)
+    elif name == "LS":
         path_str = _get_path(tool_input, ("path", "directory")) or "."
-        return _run_ls(path_str, base_dir)
+        result = _run_ls(path_str, base_dir)
+    elif name == "GlobTool":
+        result = _run_glob(tool_input, base_dir)
+    elif name == "GrepTool":
+        result = _run_grep(tool_input, base_dir)
+    else:
+        result = f"ERROR: unsupported tool: {tool_name}"
 
-    if name == "GlobTool":
-        return _run_glob(tool_input, base_dir)
-
-    if name == "GrepTool":
-        return _run_grep(tool_input, base_dir)
-
-    return f"ERROR: unsupported tool: {tool_name}"
+    logger.log(
+        TOOL_LOCAL_EXEC,
+        tool_name=name,
+        status=("ok" if not result.startswith("ERROR: ") else "error"),
+        chars=len(result),
+        duration_ms=int((time.monotonic() - start) * 1000),
+    )
+    return result
 
 
 async def execute_local_tool(tool_name: str, tool_input: dict, base_dir: str | Path = ".") -> str:
@@ -280,30 +293,60 @@ def _extract_message_content(response: object) -> str | None:
 
 
 async def summarize_exploration(tool_name: str, raw_output: str) -> str:
-    """Summarize large exploration output via Ollama; short output passes through.
+    """Summarize large non-reader tool output via Ollama; short output passes through.
 
     Outputs of length ``<= SUMMARIZE_THRESHOLD`` (4000) are returned unchanged
     without calling Ollama. Longer outputs are summarized with model
-    ``OLLAMA_MODEL`` (default ``qwen2.5-coder:7b``). If Ollama is unavailable or
-    raises, a truncated copy of *raw_output* is returned -- this function never
-    raises.
+    ``OLLAMA_MODEL`` (default ``qwen2.5-coder:7b``) -- but only for non-reader
+    tools (``GlobTool``, ``GrepTool``, ``LS``). Reader-tool output (``View``,
+    ``read_file``, ``FileRead``) IS source code, so it is passed through
+    verbatim (bounded to :data:`MAX_OUTPUT_CHARS`) instead of summarized. If
+    Ollama is unavailable or raises, a truncated copy of *raw_output* is
+    returned -- this function never raises.
     """
+    start = time.monotonic()
     if len(raw_output) <= SUMMARIZE_THRESHOLD:
-        return raw_output
-    try:
+        result = raw_output
+        decision = "passthrough_short"
+        model = None
+    elif _normalize_tool_name(tool_name) in _READER_TOOLS:
+        # Reader output is source code: summarizing it can drop API signatures,
+        # and the model fills the gaps with plausible-but-fictional identifiers
+        # (e.g. `max_size`/`env_ttl_key` for the real `max_entries`/`ttl_seconds_provider`).
+        # Preserve the exact text up to the hard bound -- see docs/ab-test-request-count.md #2.
+        result = _bounded(raw_output)
+        decision = "passthrough_reader"
+        model = None
+    else:
         model = os.environ.get("OLLAMA_MODEL", _DEFAULT_OLLAMA_MODEL)
-        response = await asyncio.to_thread(
-            ollama.chat,
-            model=model,
-            messages=[
-                {"role": "system", "content": _SUMMARIZE_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Exploration tool: {tool_name}\n\n{raw_output}"},
-            ],
-            options={"temperature": 0.0},
-        )
-        content = _extract_message_content(response)
-        if content:
-            return content
-        return _truncated(raw_output)
-    except Exception:  # noqa: BLE001 - never propagate from the shadow loop
-        return _truncated(raw_output)
+        try:
+            response = await asyncio.to_thread(
+                ollama.chat,
+                model=model,
+                messages=[
+                    {"role": "system", "content": _SUMMARIZE_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Exploration tool: {tool_name}\n\n{raw_output}"},
+                ],
+                options={"temperature": 0.0},
+            )
+            content = _extract_message_content(response)
+            if content:
+                result = content
+                decision = "summarize"
+            else:
+                result = _truncated(raw_output)
+                decision = "fallback_truncated"
+        except Exception:  # noqa: BLE001 - never propagate from the shadow loop
+            result = _truncated(raw_output)
+            decision = "fallback_truncated"
+
+    logger.log(
+        TOOL_SUMMARIZE,
+        tool_name=_normalize_tool_name(tool_name),
+        raw_chars=len(raw_output),
+        decision=decision,
+        result_chars=len(result),
+        model=model,
+        duration_ms=int((time.monotonic() - start) * 1000),
+    )
+    return result

@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from router.dispatcher import app
 from router.ollama_scorer import RoutingResult
+from router.routing_cache import TTLRoutingCache
 import router.dispatcher as dispatcher
 
 
@@ -35,11 +36,13 @@ def _hermetic(monkeypatch):
     monkeypatch.setattr(dispatcher, "_AST_CACHE", {})
     # Reset to a fresh instance of the module's cache type (OrderedDict LRU).
     monkeypatch.setattr(dispatcher, "_ROUTING_CACHE", type(dispatcher._ROUTING_CACHE)())
+    # P-0: reset the context-dir TTL routing cache so no test leaks routing state.
+    monkeypatch.setattr(dispatcher, "_ROUTING_TTL_CACHE", {})
     # Reset the per-IP rate-limit bucket store so no test leaks token state.
     monkeypatch.setattr(dispatcher, "_RATE_BUCKETS", type(dispatcher._RATE_BUCKETS)())
     monkeypatch.setattr(
         "router.ast_extractor.scan_project_codebase",
-        lambda root_dir, ignore_dirs: ["// mock.py\n- def mock()\n"],
+        lambda root_dir, ignore_dirs: (["// mock.py\n- def mock()\n"], 100),
     )
 
     def _route(skeleton, prompt):

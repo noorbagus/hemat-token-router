@@ -1,6 +1,28 @@
 # Changelog
 
 ## [Unreleased]
+### Structured JSONL logging — source-level events (Wave 3, 2026-08-28)
+- **Source-level logging**: 17 event baru di tiap service function (sebelumnya cuma 6 event dari `dispatcher.py`). AI coding tools kini bisa trace seluruh pipeline di titik keputusan masing-masing: cache (routing), fallback heuristic, gate, import expansion + budget drop, context inject, summarizer decision, CLI dispatch, server lifecycle, dan ops (passthrough/health/retry).
+- **Consolidation (1 record/keputusan)**: `AST_SCANNED`, `OLLAMA_TRIAGE`, `TOOL_LOCAL_EXEC` dipindah dari dispatcher ke emitter source-nya (`ast_extractor`, `ollama_scorer`, `tool_shadow`) — hapus duplikasi emit. `OLLAMA_TRIAGE` kehilangan `session`/`cache_hit` → re-home ke `ROUTING_CACHE_*` + `GATE_APPLIED`.
+- **`trace_id` → contextvars**: ganti global lock dengan `contextvars.ContextVar` scoped per async task; `asyncio.to_thread` membawa context ke worker thread sehingga event source-level tercoret trace yang sama. Menutup MAJOR race global `trace_id` (TASKS.md).
+- Konstanta event lengkap di `router/logger.py` + tabel event→emitter di `CONTRACTS.md` §2.
+- Tests: 139 → +per-module event-emission tests + e2e full-chain event order (single trace_id, no duplicates).
+
+### A/B Test: request-count vs output correctness (2026-08-28)
+- `docs/ab-test-request-count.md` — proxy (csmart inject + shadow) vs direct agent loop pada 2 task refactor: ARK calls **10→1** (S1) dan **≥12→2** (S2) = savings request 83-90%.
+- **Output verification negatif**: kedua output proxy **tidak dapat dipakai** (S2 = patch malformed + constructor fiktif `max_size`/`env_ttl_key`; S1 = implementasi duplikat `routing_cache.py`). Working tree baseline sudah 15 test gagal (WIP migrasi cache setengah jadi) dan output model tidak memperbaikinya. Savings request real, tapi value belum terbukti.
+- Root cause: triage tidak ikut sertakan file yang di-import target (`routing_cache.py`); shadow summarize file `.py` >4000 char menghilangkan detail signature API; tidak ada execution/test feedback loop di jalur proxy.
+
+### Performance (2026-08-28, issue #2 P0-P4)
+- **P0 — TTL routing cache**: session-less (production) requests reuse the routing per `context_dir` for `CSMART_ROUTING_TTL` (default 120s, cap 16) — Qwen is **no longer called on message 2+ per burst** (verified `cache_hit=true` @ 0ms). Log field `cache_hit`.
+- **P1 — triage model resident**: `keep_alive=-1` + `num_ctx=8192` in `ollama.chat()` — cold reload 18-26s eliminated.
+- **P2-server — Ollama env**: `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`, `OLLAMA_KEEP_ALIVE=-1`, `OLLAMA_MAX_LOADED_MODELS=1` (launchd plist; backup `.bak-20260828`). Measured prefill 139→214 t/s (+54%), decode 19→23 t/s (+21%).
+- **P3 — smaller routing input**: `_cap_skeleton` (preserves every `// <path>` header, env `CSMART_ROUTING_SKELETON_MAX_CHARS` default 6000) + `_truncate_routing_prompt` (keeps tail, env `CSMART_ROUTING_PROMPT_MAX_CHARS` default 4000). Skeleton 2,600→1,775 tokens; output JSON 61→35 tokens (reasoning ≤10 words, capped ≤120 chars, minified single-line).
+- **P4 — rounds counter fixed**: `SSE_STREAM_COMPLETE` logs `rounds=self.round - 1` (actual upstream calls) — single-round request now logs `rounds=1` (was 2).
+### Verified (live, 2026-08-28)
+- Warm `OLLAMA_TRIAGE` steady-state ≈ **2.5s** (was 4.7s) via prefix KV reuse; burst message 2+ = **0ms** routing (TTL cache hit); prefill cache-hit 15.7k-33k t/s; skeleton cap verified deterministic (26 `//` headers preserved).
+- 139 hermetic tests pass, pyright 0 errors.
+
 ### Fixed
 - S-1 header-whitelist comment corrected per live smoke (2026-08-28): the `ark.talaga.my.id` gateway accepts only `Authorization: Bearer` — `x-api-key` returns 401 — so Claude Code integration must set `ANTHROPIC_AUTH_TOKEN`, not `ANTHROPIC_API_KEY`. The allowlist is unchanged; only the comment was wrong.
 ### Verified (live smoke)

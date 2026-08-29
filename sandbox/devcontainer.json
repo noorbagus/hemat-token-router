@@ -1,0 +1,50 @@
+{
+  "name": "hemat-token-router proxy devcontainer (strict JSON)",
+  "description": "Runs the csmart proxy inside the container at http://127.0.0.1:8080. Secrets (CSMART_*, UPSTREAM_BASE_URL, UPSTREAM_API_KEY, OPENAI_API_KEY) are NOT hardcoded here; they are loaded from /secrets/.env by run.sh via postCreateCommand.",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "containerEnv": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8080",
+    "ANTHROPIC_API_KEY": "dummy",
+    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1"
+  },
+  "mounts": [
+    {
+      "type": "bind",
+      "source": "/Volumes/Xugab/LAB/PrivateLink/credentials/.env",
+      "target": "/secrets/.env",
+      "readonly": true
+    },
+    {
+      "type": "volume",
+      "source": "npm-cache",
+      "target": "/root/.npm"
+    },
+    {
+      "type": "volume",
+      "source": "pip-cache",
+      "target": "/root/.cache/pip"
+    }
+  ],
+  "runArgs": [
+    "--cap-drop=ALL",
+    "--security-opt",
+    "no-new-privileges"
+  ],
+  "postCreateCommand": "chmod +x \"$PWD/sandbox/run.sh\" && echo 'Sandbox siap. Jalankan: sandbox/run.sh'",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.black-formatter",
+        "ms-python.debugpy"
+      ]
+    }
+  },
+  "forwardPorts": [
+    8080
+  ]
+}

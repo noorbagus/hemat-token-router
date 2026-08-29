@@ -7,6 +7,7 @@ import os
 from typing import List
 from pydantic import BaseModel
 
+from router.logger import logger, GATE_APPLIED
 from .ollama_scorer import RoutingResult
 
 
@@ -50,20 +51,19 @@ def apply_gate(
 
     Returns:
         GateResult with status and selected files
+
+    Raises:
+        ValueError: If result.target_files is empty - routing produced no
+            candidate files, which is a caller error rather than a gate outcome.
     """
     BYTES_PER_TOKEN = 4
     budget_bytes = budget_tokens * BYTES_PER_TOKEN
 
-    # Case 1: No candidate files from routing
+    gate_result: GateResult
+
+    # No candidate files from routing is a caller error, not a gate state.
     if not result.target_files:
-        return GateResult(
-            status="blocked",
-            selected_files=[],
-            selected_bytes=0,
-            estimated_tokens=0,
-            dropped_count=0,
-            reason="No candidate files provided by routing.",
-        )
+        raise ValueError("apply_gate: target_files is empty; routing returned no candidate files.")
 
     # Get file sizes for all candidates, skip any files that don't exist
     file_sizes: List[tuple[str, int, float]] = []
@@ -88,7 +88,7 @@ def apply_gate(
     passing_files = [fs for fs in file_sizes if fs[2] >= threshold]
 
     if not passing_files:
-        return GateResult(
+        gate_result = GateResult(
             status="blocked",
             selected_files=[],
             selected_bytes=0,
@@ -96,48 +96,69 @@ def apply_gate(
             dropped_count=len(result.target_files),
             reason=f"All {len(result.target_files)} candidate files have confidence {result.confidence:.2f} < threshold {threshold:.2f}.",
         )
-
-    # Sort by confidence descending (already same confidence, but maintain input order if same)
-    passing_files.sort(key=lambda x: x[2], reverse=True)
-
-    # Accumulate until budget exceeded, add whole files only
-    selected: List[str] = []
-    total_bytes = 0
-
-    for path, size, _ in passing_files:
-        if total_bytes + size > budget_bytes:
-            # This file doesn't fit, stop (already sorted by confidence, drop the rest)
-            break
-        selected.append(path)
-        total_bytes += size
-
-    estimated_tokens = total_bytes // BYTES_PER_TOKEN
-    dropped = len(passing_files) - len(selected)
-
-    # Determine status
-    if len(selected) == len(passing_files):
-        # All passing files fit
-        if result.confidence >= threshold and dropped == 0:
-            status = "pass"
-            reason = f"All {len(selected)} candidate files pass confidence {result.confidence:.2f} >= {threshold:.2f} and fit within budget ({estimated_tokens} <= {budget_tokens} tokens)."
-        else:
-            status = "fallback"
-            reason = f"Some candidate files fit within budget after filtering. Selected {len(selected)} of {len(passing_files)} passing files."
     else:
-        # Budget exceeded, some selected
-        status = "fallback"
-        reason = f"Budget exceeded after selecting {len(selected)} files. Dropped {dropped} higher-confidence files that didn't fit. Estimated {estimated_tokens} tokens vs budget {budget_tokens}."
+        # Sort by confidence descending (already same confidence, but maintain input order if same)
+        passing_files.sort(key=lambda x: x[2], reverse=True)
 
-        # Edge case: nothing selected even first file is too big
-        if not selected:
-            status = "blocked"
-            reason = f"Largest candidate file ({total_bytes + passing_files[0][1]} bytes) exceeds budget {budget_bytes} bytes ({budget_tokens} tokens)."
+        # Accumulate until budget exceeded, add whole files only
+        selected: List[str] = []
+        total_bytes = 0
 
-    return GateResult(
-        status=status,
-        selected_files=selected,
-        selected_bytes=total_bytes,
-        estimated_tokens=estimated_tokens,
-        dropped_count=dropped + (len(result.target_files) - len(passing_files)),
-        reason=reason,
+        for path, size, _ in passing_files:
+            if total_bytes + size > budget_bytes:
+                # This file doesn't fit, stop (already sorted by confidence, drop the rest)
+                break
+            selected.append(path)
+            total_bytes += size
+
+        estimated_tokens = total_bytes // BYTES_PER_TOKEN
+        dropped = len(passing_files) - len(selected)
+
+        # Determine status
+        if len(selected) == len(passing_files):
+            # All passing files fit
+            if result.confidence >= threshold and dropped == 0:
+                status = "pass"
+                reason = f"All {len(selected)} candidate files pass confidence {result.confidence:.2f} >= {threshold:.2f} and fit within budget ({estimated_tokens} <= {budget_tokens} tokens)."
+            else:
+                status = "fallback"
+                reason = f"Some candidate files fit within budget after filtering. Selected {len(selected)} of {len(passing_files)} passing files."
+        else:
+            # Budget exceeded, some selected
+            status = "fallback"
+            reason = f"Budget exceeded after selecting {len(selected)} files. Dropped {dropped} higher-confidence files that didn't fit. Estimated {estimated_tokens} tokens vs budget {budget_tokens}."
+
+            # Edge case: nothing selected even first file is too big
+            if not selected:
+                status = "blocked"
+                reason = f"Largest candidate file ({total_bytes + passing_files[0][1]} bytes) exceeds budget {budget_bytes} bytes ({budget_tokens} tokens)."
+
+        gate_result = GateResult(
+            status=status,
+            selected_files=selected,
+            selected_bytes=total_bytes,
+            estimated_tokens=estimated_tokens,
+            dropped_count=dropped + (len(result.target_files) - len(passing_files)),
+            reason=reason,
+        )
+
+    logger.log(
+        GATE_APPLIED,
+        status=gate_result.status,
+        candidates=len(result.target_files),
+        selected_files=gate_result.selected_files,
+        selected_count=len(gate_result.selected_files),
+        selected_bytes=gate_result.selected_bytes,
+        estimated_tokens=gate_result.estimated_tokens,
+        dropped_count=gate_result.dropped_count,
+        threshold=threshold,
+        budget_tokens=budget_tokens,
+        confidence=result.confidence,
+        reason=gate_result.reason,
     )
+    return gate_result
+
+
+def hook_test_helper() -> int:
+    """Test helper to verify graphify post-commit hook rebuilds the graph."""
+    return 42

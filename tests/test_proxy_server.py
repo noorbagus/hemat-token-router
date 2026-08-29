@@ -7,6 +7,7 @@ upstream: the whole module runs under ``pytest -m "not live"``.
 """
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -18,14 +19,32 @@ from fastapi import Request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Real implementations captured at import time — the autouse ``_hermetic``
+# fixture re-points these module attributes per-test; the e2e test restores
+# them so the REAL source-level AST_SCANNED / OLLAMA_TRIAGE events fire.
+from router.ast_extractor import scan_project_codebase as _REAL_SCAN_PROJECT
+from router.logger import StructuredLogger
+from router.ollama_scorer import route_target_files as _REAL_ROUTE_TARGET_FILES
 from router.dispatcher import app, inject_context_to_messages
 from router.ollama_scorer import RoutingResult
+import router.ast_extractor as ast_mod
 import router.dispatcher as dispatcher
+import router.gate as gate_mod
+import router.ollama_scorer as os_mod
+import router.routing_cache as rc_mod
+import router.shadow_loop as sl_mod
+import router.tool_shadow as ts_mod
 
 
 def _run(coro):
     """Run a coroutine to completion with a fresh event loop."""
     return asyncio.run(coro)
+
+
+def _read_records(tmp_path):
+    """Read every JSONL record written to a StructuredLogger in ``tmp_path``."""
+    (f,) = tmp_path.glob("session_*.jsonl")
+    return [json.loads(l) for l in f.read_text("utf-8").strip().splitlines()]
 
 
 def _asgi_request(req: httpx.Request, *, client=("127.0.0.1", 123)) -> Request:
@@ -118,6 +137,35 @@ def _sse_tool_use_round(name: str, tool_id: str, partial_json: str) -> str:
     ])
 
 
+def _sse_tool_use_empty_input(index: int, name: str, tool_id: str) -> str:
+    """A tool_use block that streams NO input_json deltas (input stays {})."""
+    return "\n".join([
+        "event: content_block_start",
+        f'data: {{"type":"content_block_start","index":{index},"content_block":{{"type":"tool_use","id":"{tool_id}","name":"{name}","input":{{}}}}}}',
+        "",
+        "event: content_block_stop",
+        f'data: {{"type":"content_block_stop","index":{index}}}',
+        "",
+    ])
+
+
+def _sse_tool_use_empty_round(name: str, tool_id: str) -> str:
+    """A full round: message envelope + one tool_use block with empty input."""
+    return "\n".join([
+        "event: message_start",
+        'data: {"type":"message_start","message":{"id":"msg_empty","role":"assistant","content":[],"model":"mock"}}',
+        "",
+        *_sse_tool_use_empty_input(0, name, tool_id).splitlines(),
+        "",
+        "event: message_delta",
+        'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}',
+        "",
+        "event: message_stop",
+        'data: {"type":"message_stop"}',
+        "",
+    ])
+
+
 def _sse_n_tool_uses(count: int) -> str:
     """A full round with ``count`` consecutive GrepTool tool_use blocks."""
     lines = [
@@ -158,14 +206,17 @@ def _sse_n_tool_uses(count: int) -> str:
 @pytest.fixture(autouse=True)
 def _hermetic(monkeypatch):
     """Clear caches + patch routing to hermetic fixtures for every test."""
+    from router.routing_cache import LRURoutingCache, TTLRoutingCache
     monkeypatch.setattr(dispatcher, "_AST_CACHE", {})
-    # Reset to a fresh instance of the module's cache type (OrderedDict LRU).
-    monkeypatch.setattr(dispatcher, "_ROUTING_CACHE", type(dispatcher._ROUTING_CACHE)())
+    # Reset to a fresh instance of the module's cache types.
+    monkeypatch.setattr(dispatcher, "_ROUTING_CACHE", LRURoutingCache(max_entries=128))
+    # P-0: reset the context-dir TTL routing cache so no test leaks routing state.
+    monkeypatch.setattr(dispatcher, "_ROUTING_TTL_CACHE", TTLRoutingCache(max_entries=16, default_ttl_seconds=120.0))
     # Reset the per-IP rate-limit bucket store so no test leaks token state.
     monkeypatch.setattr(dispatcher, "_RATE_BUCKETS", type(dispatcher._RATE_BUCKETS)())
     monkeypatch.setattr(
         "router.ast_extractor.scan_project_codebase",
-        lambda root_dir, ignore_dirs: ["// mock.py\n- def mock()\n"],
+        lambda root_dir, ignore_dirs: (["// mock.py\n- def mock()\n"], 100),
     )
 
     def _route(skeleton, prompt):
@@ -245,6 +296,52 @@ def test_text_deltas_streamed_to_client(mock_upstream):
     assert len(calls) == 1
 
 
+def test_model_qwen_routed_to_ollama_strips_auth(mock_upstream):
+    """model == OLLAMA_MODEL routes to {OLLAMA_BASE_URL}/v1/messages, auth stripped."""
+    calls = mock_upstream([_sse_text("hi from qwen")])
+
+    resp = _run(_post_messages(
+        {
+            "model": "qwen2.5-coder:7b",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        headers={"authorization": "Bearer secret", "x-api-key": "secret2"},
+    ))
+
+    assert resp.status_code == 200
+    assert "hi from qwen" in resp.text
+    assert len(calls) == 1
+    req = calls[0]
+    assert str(req.url).startswith("http://127.0.0.1:11434/v1/messages")
+    assert "authorization" not in req.headers
+    assert "x-api-key" not in req.headers
+    # Anthropic body forwarded as-is (no protocol translation).
+    assert json.loads(req.content)["model"] == "qwen2.5-coder:7b"
+
+
+def test_model_other_routed_to_upstream_keeps_auth(mock_upstream):
+    """model != OLLAMA_MODEL keeps the existing upstream route + auth (unchanged)."""
+    calls = mock_upstream([_sse_text("hello")])
+
+    resp = _run(_post_messages(
+        {
+            "model": "deepseek-v4-flash",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        headers={"authorization": "Bearer secret"},
+    ))
+
+    assert resp.status_code == 200
+    assert "hello" in resp.text
+    assert len(calls) == 1
+    req = calls[0]
+    assert str(req.url).startswith("https://api.deepseek.com/anthropic/v1/messages")
+    assert req.headers["authorization"] == "Bearer secret"
+    assert json.loads(req.content)["model"] == "deepseek-v4-flash"
+
+
 def test_exploration_tool_use_intercepted_and_resubmitted(mock_upstream, tmp_path, monkeypatch):
     """QG-03: an exploration tool_use is held + resolved locally, not forwarded."""
     monkeypatch.setenv("CSMART_CONTEXT_DIR", str(tmp_path))
@@ -294,6 +391,97 @@ def test_shadow_rounds_bounded_at_three(mock_upstream, tmp_path, monkeypatch):
     # 3 held (never forwarded) + 2 passed through -> exactly 2 GrepTool blocks.
     assert resp.text.count('"name": "GrepTool"') == 2
     assert "done" in resp.text
+
+
+def test_max_tokens_clamped_to_floor(mock_upstream):
+    """Issue #1: max_tokens below the floor is raised to the floor upstream."""
+    calls = mock_upstream([_sse_text("ok")])
+    body = {
+        "model": "mock-model",
+        "stream": True,
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    resp = _run(_post_messages(body=body))
+
+    assert resp.status_code == 200
+    up_body = json.loads(calls[0].content)
+    assert up_body["max_tokens"] == dispatcher._min_max_tokens()
+
+
+def test_max_tokens_above_floor_preserved(mock_upstream):
+    """Issue #1: max_tokens already at/above the floor is left untouched."""
+    calls = mock_upstream([_sse_text("ok")])
+    body = {
+        "model": "mock-model",
+        "stream": True,
+        "max_tokens": 8192,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    resp = _run(_post_messages(body=body))
+
+    assert resp.status_code == 200
+    up_body = json.loads(calls[0].content)
+    assert up_body["max_tokens"] == 8192
+
+
+def test_max_tokens_defaulted_when_missing(mock_upstream):
+    """Issue #1: absent max_tokens is defaulted to the floor."""
+    calls = mock_upstream([_sse_text("ok")])
+    body = {
+        "model": "mock-model",
+        "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    resp = _run(_post_messages(body=body))
+
+    assert resp.status_code == 200
+    up_body = json.loads(calls[0].content)
+    assert up_body["max_tokens"] == dispatcher._min_max_tokens()
+
+
+def test_empty_tool_input_defensive_error(mock_upstream, tmp_path, monkeypatch):
+    """Issue #1: a tool_use with no streamed args yields an actionable error
+    (action=empty_input), not the silent 'no path provided' retry error."""
+    monkeypatch.setenv("CSMART_CONTEXT_DIR", str(tmp_path))
+    round1 = _sse_tool_use_empty_round("read_file", "tu_empty")
+    round2 = _sse_text("recovered")
+    calls = mock_upstream([round1, round2])
+
+    resp = _run(_post_messages())
+
+    assert resp.status_code == 200
+    assert "recovered" in resp.text
+    assert "tu_empty" not in resp.text  # held, never forwarded to client
+    assert len(calls) == 2
+    followup = json.loads(calls[1].content)
+    results = followup["messages"][-1]["content"]
+    assert results[0]["type"] == "tool_result"
+    assert "empty input" in results[0]["content"]
+    assert "no path provided" not in results[0]["content"]
+
+
+def test_truncated_tool_input_defensive_error(mock_upstream, tmp_path, monkeypatch):
+    """Issue #1: partial_json that never parses is flagged truncated_input."""
+    monkeypatch.setenv("CSMART_CONTEXT_DIR", str(tmp_path))
+    partial = '{"file_path": "router/dis'
+    partial_escaped = partial.replace('"', '\\"')
+    round1 = _sse_tool_use_round("read_file", "tu_partial", partial_escaped)
+    round2 = _sse_text("recovered")
+    calls = mock_upstream([round1, round2])
+
+    resp = _run(_post_messages())
+
+    assert resp.status_code == 200
+    assert "recovered" in resp.text
+    assert len(calls) == 2
+    followup = json.loads(calls[1].content)
+    results = followup["messages"][-1]["content"]
+    assert results[0]["type"] == "tool_result"
+    assert "truncated" in results[0]["content"]
 
 
 def test_routing_runs_once_per_session(mock_upstream, monkeypatch):
@@ -714,3 +902,392 @@ def cwd_tmp(tmp_path):
         yield tmp_path
     finally:
         os.chdir(old_cwd)
+
+
+# ---------------------------------------------------------------------------
+# Routing input cap tests (P-2 prefill reduction: skeleton + prompt truncation).
+# ---------------------------------------------------------------------------
+
+
+def test_cap_skeleton_under_budget_unchanged():
+    """A skeleton already under the cap is returned byte-identical."""
+    skeleton = "// a.py\n- def foo()\n- class Bar:\n"
+    assert dispatcher._cap_skeleton(skeleton, max_chars=6000) == skeleton
+
+
+def test_cap_skeleton_preserves_headers_drops_longest_signatures():
+    """Over budget: every // header is kept, the longest - signatures go first."""
+    skeleton = "\n".join([
+        "// a.py",
+        "- short",
+        "- " + "x" * 50,
+        "- " + "y" * 40,
+        "// b.py",
+        "- " + "z" * 30,
+    ])
+    capped = dispatcher._cap_skeleton(skeleton, max_chars=60)
+    assert "// a.py" in capped
+    assert "// b.py" in capped
+    assert len(capped) <= 60
+    assert ("x" * 50) not in capped  # longest dropped first
+    assert ("y" * 40) not in capped
+    assert ("z" * 30) in capped       # shortest kept
+
+
+def test_cap_skeleton_path_only_fits_by_trimming_headers():
+    """Even a path-only skeleton over an absurdly small budget keeps the first N."""
+    skeleton = "\n".join(f"// file{i}.py" for i in range(10))
+    capped = dispatcher._cap_skeleton(skeleton, max_chars=30)
+    assert len(capped) <= 30
+    assert capped.count("// file") == 2  # only the first 2 headers fit
+
+
+def test_truncate_routing_prompt_keeps_tail():
+    """Long prompts are cut to the TAIL (the task statement lives at the end)."""
+    prompt = "A" * 100 + "TASK_AT_END"
+    truncated = dispatcher._truncate_routing_prompt(prompt, max_chars=20)
+    assert truncated == "A" * 9 + "TASK_AT_END"
+    assert len(truncated) == 20
+    assert truncated.endswith("TASK_AT_END")
+
+
+def test_truncate_routing_prompt_short_unchanged():
+    """A short prompt is returned unchanged."""
+    prompt = "short task"
+    assert dispatcher._truncate_routing_prompt(prompt, max_chars=4000) == prompt
+
+
+def test_run_local_routing_passes_capped_skeleton(monkeypatch):
+    """run_local_routing hands Ollama a skeleton capped to the env budget."""
+    seen: Dict[str, Any] = {}
+    monkeypatch.setenv("CSMART_ROUTING_SKELETON_MAX_CHARS", "120")
+    big_skeleton = "\n".join(
+        f"// file{i}.py\n" + "\n".join(
+            f"- def func_{i}_{j}()" for j in range(10)
+        )
+        for i in range(5)
+    )
+
+    def _route(skeleton, prompt):
+        seen["skeleton"] = skeleton
+        return RoutingResult(target_files=[], confidence=0.0, reasoning="capped")
+
+    monkeypatch.setattr(
+        "router.ast_extractor.scan_project_codebase",
+        lambda root_dir, ignore_dirs: ([big_skeleton], len(big_skeleton)),
+    )
+    monkeypatch.setattr("router.ollama_scorer.route_target_files", _route)
+
+    _run(dispatcher.run_local_routing("task", session_key="cap-session"))
+
+    assert len(seen["skeleton"]) <= 120
+    for i in range(5):
+        assert ("// file%d.py" % i) in seen["skeleton"]
+
+
+def test_routing_ttl_cache_reuses_across_burst(monkeypatch):
+    """P-0: session-less requests with the SAME prompt route via Ollama once."""
+    route_calls: List[str] = []
+
+    def _counting_route(skeleton, prompt):
+        route_calls.append(prompt)
+        return RoutingResult(target_files=["a.py"], confidence=0.8, reasoning="ttl")
+
+    monkeypatch.setattr("router.ollama_scorer.route_target_files", _counting_route)
+    monkeypatch.setattr(
+        "router.ast_extractor.scan_project_codebase",
+        lambda root_dir, ignore_dirs: (["// a.py\n- def a()\n"], 100),
+    )
+
+    _run(dispatcher.run_local_routing("task one"))
+    _run(dispatcher.run_local_routing("task one"))
+
+    assert len(route_calls) == 1
+
+
+def test_routing_ttl_cache_prompt_differentiated(monkeypatch):
+    """FIX #2: the session-less TTL cache key includes the prompt, so a
+    different prompt on the same context_dir never reuses a stale triage, while
+    an identical prompt still hits the cache."""
+    route_calls: List[str] = []
+
+    def _counting_route(skeleton, prompt):
+        route_calls.append(prompt)
+        return RoutingResult(target_files=["a.py"], confidence=0.8, reasoning="ttl")
+
+    monkeypatch.setattr("router.ollama_scorer.route_target_files", _counting_route)
+    monkeypatch.setattr(
+        "router.ast_extractor.scan_project_codebase",
+        lambda root_dir, ignore_dirs: (["// a.py\n- def a()\n"], 100),
+    )
+
+    # Same context_dir (default "."), different prompts -> no stale hit.
+    _run(dispatcher.run_local_routing("task one"))
+    _run(dispatcher.run_local_routing("task two"))
+
+    assert len(route_calls) == 2
+
+    # Same context_dir + same prompt -> TTL cache hit, no extra triage call.
+    _run(dispatcher.run_local_routing("task one"))
+
+    assert len(route_calls) == 2
+
+
+def test_routing_ttl_cache_expires_when_ttl_zero(monkeypatch):
+    """P-0: TTL=0 disables reuse — every session-less request re-routes."""
+    route_calls: List[str] = []
+    monkeypatch.setenv("CSMART_ROUTING_TTL", "0")
+
+    def _counting_route(skeleton, prompt):
+        route_calls.append(prompt)
+        return RoutingResult(target_files=[], confidence=0.0, reasoning="ttl0")
+
+    monkeypatch.setattr("router.ollama_scorer.route_target_files", _counting_route)
+
+    _run(dispatcher.run_local_routing("one"))
+    _run(dispatcher.run_local_routing("two"))
+
+    assert len(route_calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for the extracted routing_cache module.
+# ---------------------------------------------------------------------------
+
+
+def test_lru_cache_bounded_evicts_oldest():
+    """LRU cache respects max capacity and evicts least recently used."""
+    from router.routing_cache import LRURoutingCache
+    cache = LRURoutingCache(max_entries=3)
+
+    r1 = RoutingResult(target_files=["a.py"], confidence=1.0, reasoning="r1")
+    r2 = RoutingResult(target_files=["b.py"], confidence=1.0, reasoning="r2")
+    r3 = RoutingResult(target_files=["c.py"], confidence=1.0, reasoning="r3")
+    r4 = RoutingResult(target_files=["d.py"], confidence=1.0, reasoning="r4")
+
+    cache.put("k1", r1)
+    cache.put("k2", r2)
+    cache.put("k3", r3)
+    assert len(cache) == 3
+
+    # Access k1 to bump recency
+    assert cache.get("k1") == r1
+    # Add k4 - should evict k2 (oldest now)
+    cache.put("k4", r4)
+    assert len(cache) == 3
+
+    assert cache.get("k2") is None  # evicted
+    assert cache.get("k1") == r1   # still here (recently accessed)
+    assert cache.get("k3") == r3  # still here
+    assert cache.get("k4") == r4  # added
+
+
+def test_lru_cache_get_bumps_recency():
+    """Get on an existing entry moves it to the end of the LRU order."""
+    from router.routing_cache import LRURoutingCache
+    cache = LRURoutingCache(max_entries=3)
+
+    r1 = RoutingResult(target_files=["a.py"], confidence=1.0, reasoning="r1")
+    r2 = RoutingResult(target_files=["b.py"], confidence=1.0, reasoning="r2")
+    r3 = RoutingResult(target_files=["c.py"], confidence=1.0, reasoning="r3")
+    r4 = RoutingResult(target_files=["d.py"], confidence=1.0, reasoning="r4")
+
+    cache.put("k1", r1)
+    cache.put("k2", r2)
+    cache.put("k3", r3)
+
+    # Get k1 - now it's the most recent
+    assert cache.get("k1") == r1
+    # Add k4 should evict k2 (the new oldest) not k1
+    cache.put("k4", r4)
+    assert cache.get("k1") == r1
+    assert cache.get("k2") is None
+
+
+def test_ttl_cache_bounded_evicts_oldest():
+    """TTL cache respects max capacity and evicts oldest entry by timestamp."""
+    from router.routing_cache import TTLRoutingCache
+    # Fixed TTL provider that always returns 100s (enough for this test)
+    cache = TTLRoutingCache(
+        max_entries=3,
+        default_ttl_seconds=100.0,
+        ttl_seconds_provider=lambda: 100.0,
+    )
+
+    r1 = RoutingResult(target_files=["a.py"], confidence=1.0, reasoning="r1")
+    r2 = RoutingResult(target_files=["b.py"], confidence=1.0, reasoning="r2")
+    r3 = RoutingResult(target_files=["c.py"], confidence=1.0, reasoning="r3")
+    r4 = RoutingResult(target_files=["d.py"], confidence=1.0, reasoning="r4")
+
+    cache.put("k1", r1)
+    # We need to ensure different timestamps, so sleep a tiny bit
+    import time
+    time.sleep(0.001)
+    cache.put("k2", r2)
+    time.sleep(0.001)
+    cache.put("k3", r3)
+    assert len(cache) == 3
+
+    time.sleep(0.001)
+    cache.put("k4", r4)
+    assert len(cache) == 3
+
+    # Oldest (k1) should be evicted
+    assert cache.get("k1") is None
+    assert cache.get("k2") == r2
+    assert cache.get("k3") == r3
+    assert cache.get("k4") == r4
+
+
+def test_ttl_cache_expires_stale_entries():
+    """Expired entries are evicted on lookup and None is returned."""
+    from router.routing_cache import TTLRoutingCache
+    # TTL = 0 means everything is immediately stale
+    cache = TTLRoutingCache(
+        max_entries=3,
+        default_ttl_seconds=0.0,
+        ttl_seconds_provider=lambda: 0.0,
+    )
+    r1 = RoutingResult(target_files=["a.py"], confidence=1.0, reasoning="r1")
+    cache.put("k1", r1)
+    assert len(cache) == 1
+    # Lookup should expire it
+    assert cache.get("k1") is None
+    assert len(cache) == 0
+
+
+def test_ttl_cache_reads_env_ttl():
+    """TTL cache reads CSMART_ROUTING_TTL from environment when using default provider."""
+    import os
+    from router.routing_cache import TTLRoutingCache
+    # Save original env
+    orig = os.environ.get("CSMART_ROUTING_TTL")
+    try:
+        os.environ["CSMART_ROUTING_TTL"] = "60"
+        cache = TTLRoutingCache(max_entries=16, default_ttl_seconds=120.0)
+        assert cache.ttl_seconds() == 60.0
+
+        os.environ["CSMART_ROUTING_TTL"] = "invalid"
+        cache = TTLRoutingCache(max_entries=16, default_ttl_seconds=120.0)
+        assert cache.ttl_seconds() == 120.0  # fall back to default
+
+        os.environ.pop("CSMART_ROUTING_TTL", None)
+        cache = TTLRoutingCache(max_entries=16, default_ttl_seconds=120.0)
+        assert cache.ttl_seconds() == 120.0
+    finally:
+        # Restore original env
+        if orig is None:
+            os.environ.pop("CSMART_ROUTING_TTL", None)
+        else:
+            os.environ["CSMART_ROUTING_TTL"] = orig
+
+
+# ---------------------------------------------------------------------------
+# Full-chain e2e: one intercepted request drives the REAL pipeline (AST scan,
+# Ollama triage, gate, import expansion, injection, shadow loop) and emits an
+# ordered, single-trace_id event chain with no duplicated source-level events.
+# ---------------------------------------------------------------------------
+
+
+def test_full_chain_event_sequence(mock_upstream, tmp_path, monkeypatch):
+    """The real pipeline logs every source event once, in order, one trace_id.
+
+    Intentionally bypasses the autouse ``_hermetic`` fixture's scan/routing
+    stubs (restored to the REAL implementations) so the source-level
+    AST_SCANNED / OLLAMA_TRIAGE events fire from ast_extractor / ollama_scorer;
+    only ``ollama.chat`` is stubbed with canned JSON. The GrepTool round makes
+    the shadow loop fire TOOL_SHADOW_INTERCEPT -> TOOL_LOCAL_EXEC ->
+    TOOL_SUMMARIZE.
+    """
+    # Undo the autouse _hermetic stubs so the REAL source events fire.
+    monkeypatch.setattr(ast_mod, "scan_project_codebase", _REAL_SCAN_PROJECT)
+    monkeypatch.setattr(os_mod, "route_target_files", _REAL_ROUTE_TARGET_FILES)
+
+    # A tiny real project so the AST scan finds one file.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "app.py").write_text("VALUE = 42\n\ndef run():\n    return VALUE\n")
+    monkeypatch.setenv("CSMART_CONTEXT_DIR", str(proj))
+
+    # Canned Ollama triage: route to the single project file with high confidence.
+    class _FakeMessage:
+        def __init__(self, content: str):
+            self.content = content
+
+    class _FakeOllamaResponse:
+        def __init__(self, content: str):
+            self.message = _FakeMessage(content)
+
+    def _fake_chat(**kwargs):
+        return _FakeOllamaResponse(
+            '{"target_files":["app.py"],"confidence":0.9,"reasoning":"ok"}'
+        )
+
+    monkeypatch.setattr(os_mod.ollama, "chat", _fake_chat)
+
+    # One shared capture logger across every module that emits source events.
+    cap = StructuredLogger(log_dir=tmp_path)
+    for m in (dispatcher, ast_mod, os_mod, ts_mod, gate_mod, rc_mod, sl_mod):
+        monkeypatch.setattr(m, "logger", cap)
+
+    # Upstream: a GrepTool round (held + run locally) then a plain text round.
+    partial = '{"pattern": "zzz_no_match_abc"}'
+    partial_escaped = partial.replace('"', '\\"')
+    round1 = _sse_tool_use_round("GrepTool", "tu_grep", partial_escaped)
+    round2 = _sse_text("done")
+    calls = mock_upstream([round1, round2])
+
+    resp = _run(_post_messages())
+
+    assert resp.status_code == 200
+    assert "done" in resp.text
+    assert len(calls) == 2
+
+    cap.flush()
+    cap.close()
+    records = _read_records(tmp_path)
+    events = [r["event"] for r in records]
+
+    # --- single shared trace_id (non-None) across every module's records ---
+    trace_ids = {r["trace_id"] for r in records}
+    assert None not in trace_ids, "some records are missing a trace_id"
+    assert len(trace_ids) == 1, f"expected one trace_id, got {len(trace_ids)}"
+
+    # --- exact-once source-level events (no dispatcher duplicates) ---
+    assert events.count("INBOUND_REQUEST") == 1
+    assert events.count("AST_SCANNED") == 1
+    assert events.count("OLLAMA_TRIAGE") == 1
+    assert events.count("TOOL_LOCAL_EXEC") == 1
+    assert events.count("SSE_STREAM_COMPLETE") == 1
+
+    # --- strict order of the non-cache pipeline events ---
+    core = [
+        "INBOUND_REQUEST",
+        "OLLAMA_TRIAGE",
+        "GATE_APPLIED",
+        "IMPORT_EXPANSION",
+        "CONTEXT_INJECTED",
+        "TOOL_SHADOW_INTERCEPT",
+        "TOOL_LOCAL_EXEC",
+        "TOOL_SUMMARIZE",
+        "SSE_STREAM_COMPLETE",
+    ]
+    filtered = [e for e in events if e in core]
+    assert filtered == core, f"pipeline order mismatch: {filtered}"
+
+    # AST_SCANNED lands between INBOUND_REQUEST and OLLAMA_TRIAGE.
+    assert (
+        events.index("INBOUND_REQUEST")
+        < events.index("AST_SCANNED")
+        < events.index("OLLAMA_TRIAGE")
+    )
+
+    # ROUTING_CACHE_* present and confined to the routing window.
+    cache_events = [e for e in events if e.startswith("ROUTING_CACHE")]
+    assert cache_events, "expected at least one ROUTING_CACHE_* event"
+    assert "ROUTING_CACHE_MISS" in cache_events
+    idx_inbound = events.index("INBOUND_REQUEST")
+    idx_gate = events.index("GATE_APPLIED")
+    for i, e in enumerate(events):
+        if e.startswith("ROUTING_CACHE"):
+            assert idx_inbound < i < idx_gate, f"{e} at {i} outside routing window"

@@ -5,6 +5,8 @@ Ollama: ``cmd_status`` / ``cmd_start`` are monkeypatched to no-ops where
 needed, and ``build_parser()`` only builds an argument parser.
 """
 
+import json
+
 import pytest
 
 import csmart
@@ -13,6 +15,8 @@ import router.cli_dispatch
 import router.ollama_scorer
 from csmart import build_parser
 from router.cli_dispatch import DispatchResult
+from router.gate import GateResult
+from router.logger import CLI_DISPATCH, SERVER_START, SERVER_STOP, StructuredLogger
 from router.ollama_scorer import RoutingResult
 
 
@@ -108,14 +112,15 @@ def test_main_cli_start_calls_cmd_start(monkeypatch) -> None:
     """`main_cli(["start"])` routes to cmd_start with default host/port."""
     captured: dict[str, object] = {}
 
-    def fake_start(host: str, port: int) -> None:
+    def fake_start(host: str, port: int, context_dir: str) -> None:
         captured["host"] = host
         captured["port"] = port
+        captured["context_dir"] = context_dir
 
     monkeypatch.setattr(csmart, "cmd_start", fake_start)
     result = csmart.main_cli(["start"])
     assert result is None
-    assert captured == {"host": "127.0.0.1", "port": 4000}
+    assert captured == {"host": "127.0.0.1", "port": 4000, "context_dir": "."}
 
 
 def test_main_cli_skips_path_traversal_selected_files(monkeypatch, tmp_path) -> None:
@@ -138,7 +143,7 @@ def test_main_cli_skips_path_traversal_selected_files(monkeypatch, tmp_path) -> 
     secret.write_text("SECRET=1")
 
     def fake_scan(root_dir, ignore_dirs):
-        return ["// ok.py\n- def ok()\n"]
+        return ["// ok.py\n- def ok()\n"], 100
 
     def fake_route(skeleton, prompt):
         return RoutingResult(
@@ -238,3 +243,136 @@ def test_main_cli_stats_calls_cmd_stats(monkeypatch) -> None:
     assert called[0][0] == csmart.DEFAULT_LOG_DIR
     assert called[0][1] == ".csmart"
     assert called[0][2] is False
+
+
+# --- Wave 4 Track D: structured CLI_DISPATCH / SERVER_START / SERVER_STOP ---
+
+
+def _read_records(tmp_path):
+    """Read every JSONL record written by a StructuredLogger into ``tmp_path``."""
+    (f,) = tmp_path.glob("session_*.jsonl")
+    return [json.loads(line) for line in f.read_text("utf-8").strip().splitlines()]
+
+
+@pytest.fixture
+def capture_logger(tmp_path, monkeypatch):
+    """Patch ``router.cli_dispatch.logger`` with a scratch StructuredLogger."""
+    lg = StructuredLogger(log_dir=tmp_path)
+    monkeypatch.setattr(router.cli_dispatch, "logger", lg)
+    return lg
+
+
+@pytest.fixture
+def capture_logger_csmart(tmp_path, monkeypatch):
+    """Patch ``csmart.logger`` with a scratch StructuredLogger."""
+    lg = StructuredLogger(log_dir=tmp_path)
+    monkeypatch.setattr(csmart, "logger", lg)
+    return lg
+
+
+def test_dispatch_claude_dry_run_logs_cli_dispatch(
+    monkeypatch, tmp_path, capture_logger
+) -> None:
+    """A dry-run dispatch must emit exactly one CLI_DISPATCH record (no error)."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "x.py").write_text("def f():\n    pass\n")
+    gate = GateResult(
+        status="pass",
+        selected_files=["x.py"],
+        selected_bytes=0,
+        estimated_tokens=0,
+        dropped_count=0,
+        reason="ok",
+    )
+    result = router.cli_dispatch.dispatch_claude(
+        files=["x.py"],
+        prompt="task",
+        gate_info=gate,
+        dry_run=True,
+    )
+    assert result.dry_run is True
+    assert result.exit_code == 0
+
+    capture_logger.flush()
+    records = _read_records(tmp_path)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["event"] == CLI_DISPATCH
+    assert rec["dry_run"] is True
+    assert rec["exit_code"] == 0
+    assert rec["gate_status"] == "pass"
+    assert rec["files_count"] == 1
+    assert rec["error"] is None
+
+
+def test_dispatch_claude_missing_token_logs_error(
+    monkeypatch, tmp_path, capture_logger
+) -> None:
+    """A missing gateway token must yield exit_code=1 + error in the log record."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "x.py").write_text("def f():\n    pass\n")
+    # Prevent load_dotenv(GATEWAY_ENV_PATH / GATEWAY_ENV_LOCAL_PATH) from
+    # re-populating the token.
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        router.cli_dispatch,
+        "GATEWAY_ENV_PATH",
+        str(tmp_path / "does-not-exist.env"),
+    )
+    monkeypatch.setattr(
+        router.cli_dispatch,
+        "GATEWAY_ENV_LOCAL_PATH",
+        str(tmp_path / "does-not-exist-local.env"),
+    )
+    gate = GateResult(
+        status="blocked",
+        selected_files=["x.py"],
+        selected_bytes=0,
+        estimated_tokens=0,
+        dropped_count=0,
+        reason="blocked",
+    )
+    result = router.cli_dispatch.dispatch_claude(
+        files=["x.py"],
+        prompt="task",
+        gate_info=gate,
+        dry_run=False,
+    )
+    assert result.exit_code == 1
+
+    capture_logger.flush()
+    records = _read_records(tmp_path)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["event"] == CLI_DISPATCH
+    assert rec["exit_code"] == 1
+    assert rec["dry_run"] is False
+    assert rec["error"] == "Missing ANTHROPIC_AUTH_TOKEN in gateway .env"
+
+
+def test_cmd_start_logs_server_start_stop(
+    monkeypatch, tmp_path, capture_logger_csmart
+) -> None:
+    """cmd_start must emit SERVER_START before uvicorn and SERVER_STOP after it."""
+    captured: dict[str, object] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(csmart.uvicorn, "run", fake_run)
+    csmart.main_cli(["start"])
+
+    capture_logger_csmart.flush()
+    records = _read_records(tmp_path)
+    assert len(records) == 2
+    start = next(r for r in records if r["event"] == SERVER_START)
+    stop = next(r for r in records if r["event"] == SERVER_STOP)
+    assert start["host"] == "127.0.0.1"
+    assert start["port"] == 4000
+    assert start["context_dir"] == "."
+    assert start["upstream_base_url"] == csmart.UPSTREAM_BASE_URL
+    assert start["ollama_model"] == csmart.triage_model()
+    assert stop["host"] == "127.0.0.1"
+    assert stop["port"] == 4000
+    assert captured.get("host") == "127.0.0.1"
+    assert captured.get("port") == 4000

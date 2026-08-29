@@ -1,0 +1,32 @@
+# liteLLM proxy config — pengganti csmart_proxy.py untuk path opencode-go
+# Claude Code (Anthropic /v1/messages) -> liteLLM -> opencode-go OpenAI Responses API
+#
+# Upstream: https://opencode.ai/zen/go/v1  (Responses-only; /chat/completions -> 500)
+# Model:    muse-spark-1.2-contributor (main) / deepseek-v4-pro (opus)
+#
+# Claude Code env:
+#   ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+#   ANTHROPIC_API_KEY=csmart-local-auth   (harus sama dengan master_key di bawah)
+#   ANTHROPIC_MODEL=opencode-go/muse-spark-1.2-contributor
+#   ANTHROPIC_DEFAULT_OPUS_MODEL=opencode-go/deepseek-v4-pro
+model_list:
+  - model_name: "opencode-go/muse-spark-1.2-contributor"
+    litellm_params:
+      model: "openai/muse-spark-1.2-contributor"
+      api_base: "https://opencode.ai/zen/go/v1"
+      api_key: "os.environ/OPENAI_API_KEY"
+      request_timeout: 120
+      drop_params: true
+  - model_name: "opencode-go/deepseek-v4-pro"
+    litellm_params:
+      model: "openai/deepseek-v4-pro"
+      api_base: "https://opencode.ai/zen/go/v1"
+      api_key: "os.environ/OPENAI_API_KEY"
+      request_timeout: 120
+      drop_params: true
+
+general_settings:
+  # Tanpa master_key -> proxy open (aman untuk 127.0.0.1 localhost).
+  # master_key memicu auth x-api-key lookup ke DB (butuh PostgreSQL; "No connected db"
+  # muncul tanpa DB). Claude Code mengirim x-api-key, jadi open-mode yang paling stabil.
+  drop_params: true

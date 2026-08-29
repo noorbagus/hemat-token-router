@@ -2,20 +2,23 @@
 Unit tests for gate.py budget-aware filtering.
 """
 
+import json
 import os
 import tempfile
-from router.gate import apply_gate, GateResult
+
+import pytest
+
+import router.gate as mod
+from router.gate import apply_gate
+from router.logger import StructuredLogger, GATE_APPLIED
 from router.ollama_scorer import RoutingResult
 
 
 def test_empty_routing_result():
-    """Test gate when routing returns no files."""
+    """Empty target_files raises ValueError instead of silently returning blocked."""
     result = RoutingResult(target_files=[], confidence=0.5, reasoning="No match")
-    gate_result = apply_gate(result, threshold=0.5, budget_tokens=1000)
-
-    assert gate_result.status == "blocked"
-    assert len(gate_result.selected_files) == 0
-    assert gate_result.dropped_count == 0
+    with pytest.raises(ValueError, match="target_files is empty"):
+        apply_gate(result, threshold=0.5, budget_tokens=1000)
 
 
 def test_all_below_threshold():
@@ -123,3 +126,72 @@ def test_fallback_confidence_below_but_some_above():
         gate_result = apply_gate(result, threshold=0.6, budget_tokens=100, base_dir=tmpdir)
 
         assert gate_result.status == "blocked"
+
+
+# --- GATE_APPLIED structured-log emission tests ---
+
+
+@pytest.fixture
+def capture_logger(tmp_path, monkeypatch):
+    lg = StructuredLogger(log_dir=tmp_path)
+    monkeypatch.setattr(mod, "logger", lg)
+    yield lg
+    lg.close()
+
+
+def _read_records(tmp_path):
+    (logfile,) = tmp_path.glob("session_*.jsonl")
+    return [json.loads(line) for line in logfile.read_text("utf-8").strip().splitlines()]
+
+
+def _gate_applied_record(records):
+    matches = [r for r in records if r["event"] == GATE_APPLIED]
+    assert len(matches) == 1, f"expected exactly one GATE_APPLIED record, got {len(matches)}"
+    return matches[0]
+
+
+def test_gate_applied_event_pass(capture_logger, tmp_path):
+    """GATE_APPLIED emitted with status=pass when all candidates fit."""
+    (tmp_path / "a.py").write_text("x\n" * 100)  # ~200 bytes
+    result = RoutingResult(target_files=["a.py"], confidence=0.8, reasoning="match")
+    gate_result = apply_gate(result, threshold=0.5, budget_tokens=1000, base_dir=str(tmp_path))
+
+    assert gate_result.status == "pass"
+    capture_logger.flush()
+
+    rec = _gate_applied_record(_read_records(tmp_path))
+    assert rec["status"] == "pass"
+    assert rec["candidates"] == 1
+    assert rec["selected_count"] == 1
+    assert rec["selected_files"] == ["a.py"]
+    assert rec["selected_bytes"] == gate_result.selected_bytes
+    assert rec["estimated_tokens"] == gate_result.estimated_tokens
+    assert rec["dropped_count"] == 0
+
+
+def test_gate_applied_event_fallback(capture_logger, tmp_path):
+    """GATE_APPLIED emitted with status=fallback when budget forces a drop."""
+    (tmp_path / "a.py").write_text("a" * 400)   # 400 bytes = 100 tokens
+    (tmp_path / "b.py").write_text("b" * 4000)  # 4000 bytes = 1000 tokens
+    result = RoutingResult(target_files=["a.py", "b.py"], confidence=0.8, reasoning="match")
+    gate_result = apply_gate(result, threshold=0.5, budget_tokens=150, base_dir=str(tmp_path))
+
+    assert gate_result.status == "fallback"
+    assert gate_result.selected_files == ["a.py"]
+    capture_logger.flush()
+
+    rec = _gate_applied_record(_read_records(tmp_path))
+    assert rec["status"] == "fallback"
+    assert rec["candidates"] == 2
+    assert rec["selected_count"] == 1
+    assert rec["dropped_count"] == 1
+
+
+def test_gate_applied_event_blocked_no_candidates(capture_logger, tmp_path):
+    """Empty routing input raises ValueError, so no GATE_APPLIED event is emitted."""
+    result = RoutingResult(target_files=[], confidence=0.5, reasoning="none")
+    with pytest.raises(ValueError, match="target_files is empty"):
+        apply_gate(result, threshold=0.5, budget_tokens=1000)
+
+    capture_logger.flush()
+    assert not list(tmp_path.glob("session_*.jsonl")) or not _read_records(tmp_path)

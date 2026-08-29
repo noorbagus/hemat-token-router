@@ -89,7 +89,7 @@ def test_write_load_roundtrip(tmp_path) -> None:
 
     loaded = load_report(str(path))
     assert isinstance(loaded, CsmartReport)
-    assert loaded.schema_version == "1.0"
+    assert loaded.schema_version == "1.1"
     assert loaded.status == report.status == "ok"
     assert loaded.estimated_tokens_saved == report.estimated_tokens_saved == 200
 

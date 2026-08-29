@@ -196,7 +196,7 @@ def write_report(report: dict, path: Path) -> None
 - **MAJOR** — `_run_glob` absolute patterns raise `NotImplementedError` on Py3.11+ → rejected with ERROR string + added to except tuple.
 - **MAJOR** — `_ROUTING_CACHE` unbounded → `OrderedDict` LRU capped at 128 under existing lock.
 - **MAJOR** — mid-stream `httpx.TransportError` escaped → truncated client stream → caught, graceful SSE error, `_round_failed` flag.
-- **MAJOR** — global `trace_id` race → `trace_id` threaded through `run_local_routing` + INBOUND_REQUEST/AST_SCANNED/OLLAMA_TRIAGE logs.
+- **MAJOR** — global `trace_id` race → Wave 3: fixed at the logger level via `contextvars.ContextVar` (task-scoped; `asyncio.to_thread` propagates to worker threads so source-level events share the turn's trace). The Wave-3 threading fix stays as the dispatcher-side complement.
 - **MINOR** — `os.makedirs(dirname(report_path))` crashed on dir-less `--report-path` → guarded both spots.
 - **MINOR** — SSE_STREAM_COMPLETE logged `status="ok"` even after round error → `status="error"` when `_round_failed`.
 - **Deferred (documented, non-blocking):** list-content injection in `inject_context_to_messages`, redaction depth (fields overwrite trace_id if passed), held-input reassembly seed, `round_had_held` dead var.

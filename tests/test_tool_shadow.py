@@ -5,10 +5,13 @@ is exercised. All filesystem work happens under pytest's ``tmp_path``.
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
 
+import router.tool_shadow as mod
+from router.logger import StructuredLogger
 from router.tool_shadow import (
     MAX_OUTPUT_CHARS,
     SUMMARIZE_THRESHOLD,
@@ -21,6 +24,20 @@ from router.tool_shadow import (
 def _run(coro):
     """Run a coroutine to completion with a fresh event loop."""
     return asyncio.run(coro)
+
+
+@pytest.fixture
+def capture_logger(tmp_path, monkeypatch):
+    """Swap the module's logger for a hermetic one rooted at tmp_path."""
+    lg = StructuredLogger(log_dir=tmp_path)
+    monkeypatch.setattr(mod, "logger", lg)
+    yield lg
+    lg.close()
+
+
+def _read_records(tmp_path):
+    (f,) = tmp_path.glob("session_*.jsonl")
+    return [json.loads(l) for l in f.read_text("utf-8").strip().splitlines()]
 
 
 @pytest.fixture
@@ -189,7 +206,7 @@ def test_summarize_long_dict_response(monkeypatch):
 
     monkeypatch.setattr("ollama.chat", _fake_chat)
     long_out = "q" * (SUMMARIZE_THRESHOLD + 1)
-    out = _run(summarize_exploration("View", long_out))
+    out = _run(summarize_exploration("GrepTool", long_out))
     assert out == "dict summary"
 
 
@@ -204,3 +221,164 @@ def test_summarize_long_raising(monkeypatch):
     out = _run(summarize_exploration("GrepTool", long_out))
     assert "z" * SUMMARIZE_THRESHOLD in out
     assert "truncated" in out
+
+
+@pytest.mark.parametrize("tool_name", ["View", "read_file", "FileRead"])
+def test_reader_long_passthrough_no_ollama(monkeypatch, tool_name):
+    """Reader tool output over the threshold passes through; ollama never runs."""
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("ollama.chat must not be called for reader tools")
+
+    monkeypatch.setattr("ollama.chat", _fail)
+    long_out = "s" * (SUMMARIZE_THRESHOLD + 1)
+    out = _run(summarize_exploration(tool_name, long_out))
+    assert out == long_out
+
+
+@pytest.mark.parametrize("tool_name", ["View", "read_file", "FileRead"])
+def test_reader_over_max_still_bounded(monkeypatch, tool_name):
+    """Reader tool output over MAX_OUTPUT_CHARS is bounded, never summarized."""
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("ollama.chat must not be called for reader tools")
+
+    monkeypatch.setattr("ollama.chat", _fail)
+    huge = "s" * (MAX_OUTPUT_CHARS + 1000)
+    out = _run(summarize_exploration(tool_name, huge))
+    assert len(out) <= MAX_OUTPUT_CHARS
+    assert "truncated" in out
+
+
+def test_non_reader_long_calls_ollama(monkeypatch):
+    """Non-reader tool output over the threshold still calls ollama.chat."""
+
+    calls = {"count": 0}
+
+    def _fake_chat(**kwargs):
+        calls["count"] += 1
+        return {"message": {"content": "mock summary"}}
+
+    monkeypatch.setattr("ollama.chat", _fake_chat)
+    long_out = "g" * (SUMMARIZE_THRESHOLD + 1)
+    out = _run(summarize_exploration("GrepTool", long_out))
+    assert out == "mock summary"
+    assert calls["count"] == 1
+
+
+@pytest.mark.parametrize("tool_name", TOOL_NAMES)
+def test_short_unchanged_any_tool(monkeypatch, tool_name):
+    """Short output (<= threshold) passes through unchanged for every tool."""
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("ollama.chat must not be called for short output")
+
+    monkeypatch.setattr("ollama.chat", _fail)
+    short = "c" * SUMMARIZE_THRESHOLD
+    out = _run(summarize_exploration(tool_name, short))
+    assert out == short
+
+
+def test_non_reader_raising_falls_back_truncated(monkeypatch):
+    """Non-reader: ollama.chat raising -> truncated raw output, never raises."""
+
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("ollama down")
+
+    monkeypatch.setattr("ollama.chat", _raise)
+    long_out = "t" * (SUMMARIZE_THRESHOLD + 1)
+    out = _run(summarize_exploration("GlobTool", long_out))
+    assert "t" * SUMMARIZE_THRESHOLD in out
+    assert "truncated" in out
+
+
+# --- TOOL_LOCAL_EXEC logging -------------------------------------------
+
+
+def test_tool_local_exec_logs_ok(capture_logger, tmp_path):
+    """A successful local read emits exactly one TOOL_LOCAL_EXEC record."""
+    target = tmp_path / "a.txt"
+    content = "hello shadow\n"
+    target.write_text(content, encoding="utf-8")
+    out = _run(execute_local_tool("View", {"file_path": "a.txt"}, base_dir=tmp_path))
+    assert out == content
+    capture_logger.flush()
+    records = [r for r in _read_records(tmp_path) if r["event"] == "TOOL_LOCAL_EXEC"]
+    assert len(records) == 1
+    assert records[0]["status"] == "ok"
+    assert records[0]["chars"] == len(content)
+    assert records[0]["tool_name"] == "View"
+    assert records[0]["duration_ms"] >= 0
+
+
+def test_tool_local_exec_logs_traversal_error(capture_logger, tmp_path):
+    """A traversal attempt emits exactly one TOOL_LOCAL_EXEC record with status error."""
+    out = _run(execute_local_tool("View", {"path": "/etc/passwd"}, base_dir=tmp_path))
+    assert out.startswith("ERROR: ")
+    capture_logger.flush()
+    records = [r for r in _read_records(tmp_path) if r["event"] == "TOOL_LOCAL_EXEC"]
+    assert len(records) == 1
+    assert records[0]["status"] == "error"
+    assert records[0]["chars"] == len(out)
+    assert records[0]["tool_name"] == "View"
+
+
+# --- TOOL_SUMMARIZE logging --------------------------------------------
+
+
+def test_summarize_logs_short_passthrough(capture_logger, tmp_path):
+    """Short output -> decision passthrough_short, model is None."""
+    short = "x" * 100
+    out = _run(summarize_exploration("GlobTool", short))
+    assert out == short
+    capture_logger.flush()
+    (record,) = [r for r in _read_records(tmp_path) if r["event"] == "TOOL_SUMMARIZE"]
+    assert record["decision"] == "passthrough_short"
+    assert record["model"] is None
+    assert record["result_chars"] == len(short)
+
+
+def test_summarize_logs_reader_passthrough(capture_logger, tmp_path):
+    """Reader tool with long output -> decision passthrough_reader, model is None."""
+    long_out = "x" * 5000
+    out = _run(summarize_exploration("View", long_out))
+    assert out == long_out
+    capture_logger.flush()
+    (record,) = [r for r in _read_records(tmp_path) if r["event"] == "TOOL_SUMMARIZE"]
+    assert record["decision"] == "passthrough_reader"
+    assert record["model"] is None
+    assert record["result_chars"] == len(long_out)
+
+
+def test_summarize_logs_ollama_summarize(capture_logger, tmp_path, monkeypatch):
+    """Successful ollama summarize -> decision summarize with resolved model."""
+
+    def _fake_chat(**kwargs):
+        return SimpleNamespace(message=SimpleNamespace(content="summary"))
+
+    monkeypatch.setattr(mod.ollama, "chat", _fake_chat)
+    long_out = "y" * (SUMMARIZE_THRESHOLD + 1)
+    out = _run(summarize_exploration("GlobTool", long_out))
+    assert out == "summary"
+    capture_logger.flush()
+    (record,) = [r for r in _read_records(tmp_path) if r["event"] == "TOOL_SUMMARIZE"]
+    assert record["decision"] == "summarize"
+    assert record["result_chars"] == len("summary")
+    assert record["model"] is not None
+
+
+def test_summarize_logs_fallback_truncated(capture_logger, tmp_path, monkeypatch):
+    """ollama.chat raising -> decision fallback_truncated, model resolved."""
+
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("ollama down")
+
+    monkeypatch.setattr(mod.ollama, "chat", _raise)
+    long_out = "z" * (SUMMARIZE_THRESHOLD + 1)
+    out = _run(summarize_exploration("GlobTool", long_out))
+    assert "z" * SUMMARIZE_THRESHOLD in out
+    assert "truncated" in out
+    capture_logger.flush()
+    (record,) = [r for r in _read_records(tmp_path) if r["event"] == "TOOL_SUMMARIZE"]
+    assert record["decision"] == "fallback_truncated"
+    assert record["model"] is not None

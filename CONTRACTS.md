@@ -38,7 +38,58 @@ OLLAMA_TRIAGE = "OLLAMA_TRIAGE"
 TOOL_SHADOW_INTERCEPT = "TOOL_SHADOW_INTERCEPT"
 TOOL_LOCAL_EXEC = "TOOL_LOCAL_EXEC"
 SSE_STREAM_COMPLETE = "SSE_STREAM_COMPLETE"
+
+# Wave 3 — source-level events (tiap service function emit di titik keputusannya)
+AST_CACHE_HIT = "AST_CACHE_HIT"
+ROUTING_CACHE_HIT = "ROUTING_CACHE_HIT"
+ROUTING_CACHE_MISS = "ROUTING_CACHE_MISS"
+ROUTING_CACHE_EXPIRED = "ROUTING_CACHE_EXPIRED"
+ROUTING_CACHE_PUT = "ROUTING_CACHE_PUT"
+OLLAMA_FALLBACK = "OLLAMA_FALLBACK"
+GATE_APPLIED = "GATE_APPLIED"
+IMPORT_EXPANSION = "IMPORT_EXPANSION"
+CONTEXT_INJECTED = "CONTEXT_INJECTED"
+TOOL_SUMMARIZE = "TOOL_SUMMARIZE"
+CLI_DISPATCH = "CLI_DISPATCH"
+SERVER_START = "SERVER_START"
+SERVER_STOP = "SERVER_STOP"
+# Operational events (health / passthrough / retry)
+PASSTHROUGH = "PASSTHROUGH"
+UPSTREAM_HEALTH = "UPSTREAM_HEALTH"
+OLLAMA_HEALTH = "OLLAMA_HEALTH"
+UPSTREAM_RETRY = "UPSTREAM_RETRY"
+MODEL_ROUTED = "MODEL_ROUTED"
 ```
+
+**Event → emitter (1 record per keputusan, Wave 3):**
+
+| Event | Emitter | Fields kunci |
+|---|---|---|
+| `INBOUND_REQUEST` | `dispatcher.handle_messages_request` | path, prompt_len, session |
+| `AST_SCANNED` | `ast_extractor.scan_project_codebase` | root_dir, scanned_files_count, files_encountered, parse_failures, full_codebase_bytes, skeleton_bytes, duration_ms |
+| `AST_CACHE_HIT` | `dispatcher._get_or_scan_ast` | context_dir, scanned_files_count, cache_size |
+| `ROUTING_CACHE_HIT/MISS/EXPIRED/PUT` | `routing_cache.LRU/TTL.get/.put` | cache(lru\|ttl), key, size, ttl_seconds, age_ms, evicted |
+| `OLLAMA_TRIAGE` | `ollama_scorer.route_target_files` (`source="ollama"`) / `_keyword_heuristic` (`source="heuristic"`) | model, source, confidence, selected_files, reasoning, prompt_eval_count, eval_count, duration_ms |
+| `TOKEN_SAVINGS` | `csmart.main_cli` / `dispatcher.run_local_routing` | full_codebase_bytes, injected_bytes, estimated_tokens_saved, status/gate_status |
+| `OLLAMA_FALLBACK` | `ollama_scorer._keyword_heuristic` | model, error(≤200), keywords_count, matched_files, confidence, duration_ms |
+| `GATE_APPLIED` | `gate.apply_gate` | status, candidates, selected_files, selected_count, selected_bytes, estimated_tokens, dropped_count, threshold, budget_tokens, confidence, reason |
+| `IMPORT_EXPANSION` | `dispatcher._expand_selected_with_imports` | base_dir, selected_count, appended_count, expanded_count, dropped_by_budget, budget_tokens, total_bytes |
+| `CONTEXT_INJECTED` | `dispatcher.inject_context_to_messages` | files_requested, files_injected, skipped_count, bytes_injected, base_dir |
+| `TOOL_SHADOW_INTERCEPT` | `dispatcher._execute_held` | action_taken, tool_name |
+| `TOOL_LOCAL_EXEC` | `tool_shadow._execute_local_tool_sync` | tool_name, status(ok\|error), chars, duration_ms |
+| `TOOL_SUMMARIZE` | `tool_shadow.summarize_exploration` | tool_name, raw_chars, decision(passthrough_short\|passthrough_reader\|summarize\|fallback_truncated), result_chars, model, duration_ms |
+| `SSE_STREAM_COMPLETE` | `dispatcher._ShadowStreamer` | duration_ms, rounds, shadow_used, status |
+| `CLI_DISPATCH` | `cli_dispatch.dispatch_claude` | files_count, prompt_len, gate_status, dry_run, exit_code, duration_ms, cost_usd, session_id, error |
+| `SERVER_START` / `SERVER_STOP` | `csmart.cmd_start` | host, port, upstream_base_url, ollama_model, context_dir |
+| `PASSTHROUGH` | `dispatcher.passthrough_request` | path, method, status_code, duration_ms |
+| `UPSTREAM_HEALTH` | `dispatcher.check_upstream_health` | ok, status_code, duration_ms |
+| `OLLAMA_HEALTH` | `dispatcher.check_ollama_health` | ok, model, error |
+| `UPSTREAM_RETRY` | `dispatcher._request_upstream` | attempt, max_retries, error |
+| `MODEL_ROUTED` | `dispatcher.forward_streaming_request` / `_forward_streaming_ollama` | model, target(ollama\|upstream), upstream |
+
+**Re-homing (Wave 3):** `AST_SCANNED`, `OLLAMA_TRIAGE`, `TOOL_LOCAL_EXEC` dipindah dari dispatcher ke source-nya. `OLLAMA_TRIAGE` kehilangan `session`/`cache_hit`/`selected_files` — info itu pindah ke `ROUTING_CACHE_*.key` + `GATE_APPLIED`.
+
+**`trace_id`** scoped per async task via `contextvars.ContextVar` (bukan global lock) — `asyncio.to_thread` membawa context ke worker thread, jadi event source-level (route_target_files, apply_gate, _execute_local_tool_sync, summarize, scan) tercoret trace yang sama dengan turn-nya. `log()` tetap bisa di-override eksplisit lewat kwarg `trace_id=`.
 
 Redaksi key: `authorization`, `api_key`, `x-api-key`, `token` (value → `[REDACTED]`).
 

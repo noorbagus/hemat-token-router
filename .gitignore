@@ -19,6 +19,7 @@ unpacked-egg/
 
 # csmart artifacts
 .csmart/
+csmart_state.db
 
 # IDE
 .vscode/

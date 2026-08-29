@@ -18,7 +18,13 @@ from collections.abc import Iterable
 
 import uvicorn
 
-from router.dispatcher import app, check_ollama_health, check_upstream_health
+from router.dispatcher import (
+    UPSTREAM_BASE_URL,
+    app,
+    check_ollama_health,
+    check_upstream_health,
+)
+from router.logger import SERVER_START, SERVER_STOP, TOKEN_SAVINGS, logger
 from router.logs_viewer import DEFAULT_LOG_DIR, cmd_logs, cmd_stats
 from router.ollama_scorer import triage_model
 
@@ -257,13 +263,29 @@ def cmd_status() -> None:
         sys.exit(1)
 
 
-def cmd_start(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+def cmd_start(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    context_dir: str = ".",
+) -> None:
     """Start the local reverse proxy server."""
     print(f"csmart starting reverse proxy on {host}:{port}")
-    print(f"  Upstream: {os.environ.get('ANTHROPIC_UPSTREAM_URL', 'https://ark.talaga.my.id')}")
+    print(f"  Upstream: {os.environ.get('ANTHROPIC_UPSTREAM_URL', 'https://api.deepseek.com/anthropic')}")
     print(f"  Set ANTHROPIC_BASE_URL=http://{host}:{port} in your shell before running claude")
     print()
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    logger.log(
+        SERVER_START,
+        host=host,
+        port=port,
+        upstream_base_url=UPSTREAM_BASE_URL,
+        ollama_model=triage_model(),
+        context_dir=context_dir,
+    )
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="info")
+    finally:
+        logger.log(SERVER_STOP, host=host, port=port)
+        logger.flush()
 
 
 def main_cli(argv: list[str] | None = None) -> None:
@@ -276,7 +298,7 @@ def main_cli(argv: list[str] | None = None) -> None:
     from typing import Optional
     from router.ast_extractor import scan_project_codebase
     from router.ollama_scorer import route_target_files
-    from router.gate import apply_gate
+    from router.gate import GateResult, apply_gate
     from router.safe_path import PathTraversalError, resolve_under_base
     from router.cli_dispatch import dispatch_claude, DispatchResult
     from router.report import GatewayConfig, create_report, write_report
@@ -298,7 +320,7 @@ def main_cli(argv: list[str] | None = None) -> None:
         return  # cmd_status exits itself; this return is for testability
 
     if args.command == "start":
-        cmd_start(args.host, args.port)
+        cmd_start(args.host, args.port, args.context_dir)
         return
 
     if args.command == "logs":
@@ -317,7 +339,9 @@ def main_cli(argv: list[str] | None = None) -> None:
     # Original CLI flow
     # Step 1: AST skeleton extraction
     t0 = time.time()
-    skeletons = scan_project_codebase(args.context_dir, DEFAULT_IGNORE_DIRS)
+    skeletons, full_codebase_bytes = scan_project_codebase(
+        args.context_dir, DEFAULT_IGNORE_DIRS
+    )
     t_ast = int((time.time() - t0) * 1000)
 
     # Combine all skeletons into one payload
@@ -331,17 +355,28 @@ def main_cli(argv: list[str] | None = None) -> None:
     # Step 3: Apply confidence gate and budget cap.
     # apply_gate takes *tokens* (it converts to bytes internally); the old
     # `* 4` passed bytes-as-tokens, making the budget 4x too lenient.
-    gate_result = apply_gate(
-        routing_result, args.threshold, args.budget, base_dir=args.context_dir
-    )
+    # Empty routing input would raise ValueError; surface it as a blocked report.
+    if not routing_result.target_files:
+        gate_result = GateResult(
+            status="blocked",
+            selected_files=[],
+            selected_bytes=0,
+            estimated_tokens=0,
+            dropped_count=0,
+            reason="No candidate files provided by routing.",
+        )
+    else:
+        gate_result = apply_gate(
+            routing_result, args.threshold, args.budget, base_dir=args.context_dir
+        )
 
     # Check if we should abort in --strict mode
     if args.strict and gate_result.status == "blocked":
         status = "gate_blocked"
         gateway_config = GatewayConfig(
-            base_url=os.getenv("ANTHROPIC_BASE_URL", "https://ark.talaga.my.id"),
-            primary_model=os.getenv("ANTHROPIC_MODEL", "doubao-seed-2.0-lite"),
-            opus_model=os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "glm-5.3"),
+            base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"),
+            primary_model=os.getenv("ANTHROPIC_MODEL", "deepseek-v4-flash"),
+            opus_model=os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "deepseek-v4-pro"),
             fast_model=os.getenv("ANTHROPIC_SMALL_FAST_MODEL", "deepseek-v4-flash"),
             effort_level=os.getenv("CLAUDE_CODE_EFFORT_LEVEL", "low"),
         )
@@ -356,6 +391,14 @@ def main_cli(argv: list[str] | None = None) -> None:
             claude_result=None,
             status=status,
             skeleton_bytes=len(full_skeleton.encode("utf-8")),
+            full_codebase_bytes=full_codebase_bytes,
+        )
+        logger.log(
+            TOKEN_SAVINGS,
+            full_codebase_bytes=full_codebase_bytes,
+            injected_bytes=0,
+            estimated_tokens_saved=report.estimated_tokens_saved,
+            status=status,
         )
         report_path = args.report_path
         report_dir = os.path.dirname(report_path)
@@ -399,9 +442,9 @@ def main_cli(argv: list[str] | None = None) -> None:
 
     # Step 5: Dispatch to Claude Code CLI
     gateway_config = GatewayConfig(
-        base_url=os.getenv("ANTHROPIC_BASE_URL", "https://ark.talaga.my.id"),
-        primary_model=os.getenv("ANTHROPIC_MODEL", "doubao-seed-2.0-lite"),
-        opus_model=os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "glm-5.3"),
+        base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic"),
+        primary_model=os.getenv("ANTHROPIC_MODEL", "deepseek-v4-flash"),
+        opus_model=os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "deepseek-v4-pro"),
         fast_model=os.getenv("ANTHROPIC_SMALL_FAST_MODEL", "deepseek-v4-flash"),
         effort_level=os.getenv("CLAUDE_CODE_EFFORT_LEVEL", "low"),
     )
@@ -441,6 +484,14 @@ def main_cli(argv: list[str] | None = None) -> None:
         claude_result=dispatch_result,
         status=status,
         skeleton_bytes=len(full_skeleton.encode("utf-8")),
+        full_codebase_bytes=full_codebase_bytes,
+    )
+    logger.log(
+        TOKEN_SAVINGS,
+        full_codebase_bytes=full_codebase_bytes,
+        injected_bytes=injected_bytes,
+        estimated_tokens_saved=report.estimated_tokens_saved,
+        status=status,
     )
     report_path = args.report_path
     report_dir = os.path.dirname(report_path)

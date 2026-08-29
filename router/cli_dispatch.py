@@ -30,10 +30,16 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from router.gate import GateResult
+from router.logger import CLI_DISPATCH, logger
 
-# Hardcoded gateway credentials path (unchanged from the old dispatcher).
+# Gateway credentials paths + upstream base URL (env-driven, default DeepSeek).
 GATEWAY_ENV_PATH = "/Volumes/Xugab/LAB/PrivateLink/credentials/.env"
-GATEWAY_BASE_URL = "https://ark.talaga.my.id"
+GATEWAY_ENV_LOCAL_PATH = "/Volumes/Xugab/LAB/PrivateLink/.env.local"
+GATEWAY_BASE_URL = (
+    os.environ.get("ANTHROPIC_UPSTREAM_URL")
+    or os.environ.get("ANTHROPIC_BASE_URL")
+    or "https://api.deepseek.com/anthropic"
+)
 
 
 class DispatchResult(BaseModel):
@@ -106,9 +112,12 @@ def dispatch_claude(
 
     final_prompt = "\n".join(prompt_parts)
 
+    error: Optional[str] = None
+    result: DispatchResult
+
     # Step 3: dry-run exits before any subprocess.
     if dry_run:
-        return DispatchResult(
+        result = DispatchResult(
             exit_code=0,
             duration_ms=0,
             cost_usd=None,
@@ -116,103 +125,124 @@ def dispatch_claude(
             result_excerpt=f"Dry run: composed prompt with {len(files)} files, {len(final_prompt)} chars",
             dry_run=True,
         )
+    else:
+        # Step 4: load gateway environment + auth token.
+        load_dotenv(GATEWAY_ENV_PATH)
+        load_dotenv(GATEWAY_ENV_LOCAL_PATH)
+        auth_token = os.getenv("ANTHROPIC_AUTH_TOKEN")
+        if not auth_token:
+            result = DispatchResult(
+                exit_code=1,
+                duration_ms=0,
+                cost_usd=None,
+                session_id=None,
+                result_excerpt="Missing ANTHROPIC_AUTH_TOKEN in gateway .env",
+                dry_run=False,
+            )
+            error = "Missing ANTHROPIC_AUTH_TOKEN in gateway .env"
+        else:
+            cmd = [
+                "claude",
+                "-p",
+                final_prompt,
+                "--output-format",
+                "json",
+                "--max-turns",
+                "1",
+            ]
 
-    # Step 4: load gateway environment + auth token.
-    load_dotenv(GATEWAY_ENV_PATH)
-    auth_token = os.getenv("ANTHROPIC_AUTH_TOKEN")
-    if not auth_token:
-        return DispatchResult(
-            exit_code=1,
-            duration_ms=0,
-            cost_usd=None,
-            session_id=None,
-            result_excerpt="Missing ANTHROPIC_AUTH_TOKEN in gateway .env",
-            dry_run=False,
-        )
+            env = os.environ.copy()
+            env["ANTHROPIC_AUTH_TOKEN"] = auth_token
+            env["ANTHROPIC_BASE_URL"] = GATEWAY_BASE_URL
+            # The model comes from the environment (ANTHROPIC_MODEL etc.); the
+            # gate no longer carries a fallback_model (F-06).
 
-    cmd = [
-        "claude",
-        "-p",
-        final_prompt,
-        "--output-format",
-        "json",
-        "--max-turns",
-        "1",
-    ]
+            # Step 5: execute and measure.
+            start_time = time.time()
+            try:
+                subprocess_result = subprocess.run(
+                    cmd,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                duration_ms = int((time.time() - start_time) * 1000)
+                result = DispatchResult(
+                    exit_code=1,
+                    duration_ms=duration_ms,
+                    cost_usd=None,
+                    session_id=None,
+                    result_excerpt=f"Claude dispatch timed out after {timeout}s",
+                    dry_run=False,
+                )
+                error = f"Claude dispatch timed out after {timeout}s"
+            except Exception as exc:  # noqa: BLE001 - surface any invocation failure
+                duration_ms = int((time.time() - start_time) * 1000)
+                result = DispatchResult(
+                    exit_code=1,
+                    duration_ms=duration_ms,
+                    cost_usd=None,
+                    session_id=None,
+                    result_excerpt=f"Exception invoking Claude: {str(exc)}",
+                    dry_run=False,
+                )
+                error = str(exc)[:200]
+            else:
+                duration_ms = int((time.time() - start_time) * 1000)
 
-    env = os.environ.copy()
-    env["ANTHROPIC_AUTH_TOKEN"] = auth_token
-    env["ANTHROPIC_BASE_URL"] = GATEWAY_BASE_URL
-    # The model comes from the environment (ANTHROPIC_MODEL etc.); the gate no
-    # longer carries a fallback_model (F-06).
+                # Step 6: parse output.
+                exit_code = subprocess_result.returncode
+                cost_usd: Optional[float] = None
+                session_id: Optional[str] = None
+                result_excerpt: Optional[str] = None
 
-    # Step 5: execute and measure.
-    start_time = time.time()
-    try:
-        result = subprocess.run(
-            cmd,
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        duration_ms = int((time.time() - start_time) * 1000)
-        return DispatchResult(
-            exit_code=1,
-            duration_ms=duration_ms,
-            cost_usd=None,
-            session_id=None,
-            result_excerpt=f"Claude dispatch timed out after {timeout}s",
-            dry_run=False,
-        )
-    except Exception as exc:  # noqa: BLE001 - surface any invocation failure
-        duration_ms = int((time.time() - start_time) * 1000)
-        return DispatchResult(
-            exit_code=1,
-            duration_ms=duration_ms,
-            cost_usd=None,
-            session_id=None,
-            result_excerpt=f"Exception invoking Claude: {str(exc)}",
-            dry_run=False,
-        )
+                if subprocess_result.stdout:
+                    try:
+                        output_json: dict[str, Any] = json.loads(
+                            subprocess_result.stdout
+                        )
+                        cost_usd = output_json.get("cost_usd")
+                        session_id = output_json.get("session_id")
+                        content = output_json.get("content", "")
+                        if content:
+                            content_excerpt = content[:500]
+                            if len(content) > 500:
+                                content_excerpt += "..."
+                            result_excerpt = content_excerpt
+                    except json.JSONDecodeError:
+                        stdout_excerpt = subprocess_result.stdout[:500]
+                        if len(subprocess_result.stdout) > 500:
+                            stdout_excerpt += "..."
+                        result_excerpt = stdout_excerpt
+                elif subprocess_result.stderr:
+                    stderr_excerpt = f"stderr: {subprocess_result.stderr[:500]}"
+                    if len(subprocess_result.stderr) > 500:
+                        stderr_excerpt += "..."
+                    result_excerpt = stderr_excerpt
 
-    duration_ms = int((time.time() - start_time) * 1000)
+                result = DispatchResult(
+                    exit_code=exit_code,
+                    duration_ms=duration_ms,
+                    cost_usd=cost_usd,
+                    session_id=session_id,
+                    result_excerpt=result_excerpt,
+                    dry_run=False,
+                )
 
-    # Step 6: parse output.
-    exit_code = result.returncode
-    cost_usd: Optional[float] = None
-    session_id: Optional[str] = None
-    result_excerpt: Optional[str] = None
-
-    if result.stdout:
-        try:
-            output_json: dict[str, Any] = json.loads(result.stdout)
-            cost_usd = output_json.get("cost_usd")
-            session_id = output_json.get("session_id")
-            content = output_json.get("content", "")
-            if content:
-                content_excerpt = content[:500]
-                if len(content) > 500:
-                    content_excerpt += "..."
-                result_excerpt = content_excerpt
-        except json.JSONDecodeError:
-            stdout_excerpt = result.stdout[:500]
-            if len(result.stdout) > 500:
-                stdout_excerpt += "..."
-            result_excerpt = stdout_excerpt
-    elif result.stderr:
-        stderr_excerpt = f"stderr: {result.stderr[:500]}"
-        if len(result.stderr) > 500:
-            stderr_excerpt += "..."
-        result_excerpt = stderr_excerpt
-
-    return DispatchResult(
-        exit_code=exit_code,
-        duration_ms=duration_ms,
-        cost_usd=cost_usd,
-        session_id=session_id,
-        result_excerpt=result_excerpt,
-        dry_run=False,
+    logger.log(
+        CLI_DISPATCH,
+        files_count=len(files),
+        prompt_len=len(final_prompt),
+        gate_status=gate_info.status,
+        dry_run=result.dry_run,
+        exit_code=result.exit_code,
+        duration_ms=result.duration_ms,
+        cost_usd=result.cost_usd,
+        session_id=result.session_id,
+        error=error,
     )
+
+    return result
