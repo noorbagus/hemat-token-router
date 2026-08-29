@@ -811,6 +811,71 @@ def test_responses_sse_transform_tool_args_done_only():
     )
 
 
+def test_responses_sse_transform_parallel_tool_args_in_item_done():
+    """C1b regression: with 2 parallel function_calls where ONLY the first
+    streams args (function_call_arguments.delta/.done) and the second carries its
+    args exclusively in the final output_item.done item.arguments (no delta/.done
+    events for it), both tool_use blocks must receive arguments — the second must
+    NOT be left with input {} (live signature seen with muse-spark: output_item.
+    added:3, function_call_arguments.delta:1, function_call_arguments.done:1)."""
+    raw_events: list[tuple[str | None, dict[str, Any]]] = [
+        ("response.created", {"type": "response.created"}),
+        (
+            "response.output_item.added",
+            {"type": "response.output_item.added",
+             "item": {"id": "msg1", "type": "message", "role": "assistant",
+                      "content": [{"type": "output_text", "text": ""}]}},
+        ),
+        # Tool A: Read — args streamed via delta + done
+        (
+            "response.output_item.added",
+            {"type": "response.output_item.added",
+             "item": {"id": "fc_A", "type": "function_call", "call_id": "call_A",
+                      "name": "Read", "arguments": "", "status": "in_progress"}},
+        ),
+        ("response.function_call_arguments.delta",
+         {"type": "response.function_call_arguments.delta", "delta": '{"file_path": "'}),
+        ("response.function_call_arguments.delta",
+         {"type": "response.function_call_arguments.delta", "delta": 'CLAUDE.md"}'}),
+        ("response.function_call_arguments.done",
+         {"type": "response.function_call_arguments.done",
+          "delta": '{"file_path": "CLAUDE.md"}'}),
+        # Tool B: Bash — NO delta / NO arguments.done; args ONLY in item.done
+        (
+            "response.output_item.added",
+            {"type": "response.output_item.added",
+             "item": {"id": "fc_B", "type": "function_call", "call_id": "call_B",
+                      "name": "Bash", "arguments": "", "status": "in_progress"}},
+        ),
+        (
+            "response.output_item.done",
+            {"type": "response.output_item.done",
+             "item": {"id": "fc_B", "type": "function_call", "call_id": "call_B",
+                      "name": "Bash", "arguments": '{"command": "ls"}',
+                      "status": "completed"}},
+        ),
+        (
+            "response.output_item.done",
+            {"type": "response.output_item.done",
+             "item": {"id": "fc_A", "type": "function_call", "call_id": "call_A",
+                      "name": "Read", "arguments": '{"file_path": "CLAUDE.md"}',
+                      "status": "completed"}},
+        ),
+        ("response.completed", {"type": "response.completed"}),
+    ]
+    result = _collect_sse(raw_events)
+
+    # Concatenated partial_json must contain BOTH tools' full args JSON.
+    json_frags = "".join(
+        d["delta"]["partial_json"]
+        for _, d in result
+        if isinstance(d, dict) and d.get("type") == "content_block_delta"
+        and d.get("delta", {}).get("type") == "input_json_delta"
+    )
+    assert '{"file_path": "CLAUDE.md"}' in json_frags, json_frags
+    assert '{"command": "ls"}' in json_frags, json_frags
+
+
 def test_responses_sse_transform_output_text_done():
     """A provider that emits ONLY response.output_text.done (final full text)
     with no .delta events must still deliver the text to the client."""

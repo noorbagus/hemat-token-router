@@ -1716,6 +1716,26 @@ async def transform_openai_responses_sse_to_anthropic(
         if event_type == "response.output_item.done":
             item = openai_event.get("item", {})
             if item.get("type") == "function_call":
+                # C1b: some providers deliver a function call's arguments ONLY in
+                # the final output_item.done item.arguments — no function_call_
+                # arguments.delta/.done events fire for that tool at all (seen
+                # live with muse-spark parallel tool calls). Backfill so the
+                # tool_use input is not left as {}. Guarded by tool_args_streamed
+                # to avoid double-emitting when args already streamed.
+                if not tool_args_streamed:
+                    args = item.get("arguments", "")
+                    if isinstance(args, dict):
+                        try:
+                            args = json.dumps(args, sort_keys=True)
+                        except (TypeError, ValueError):
+                            args = str(args)
+                    if args:
+                        tool_args_streamed = True
+                        yield "content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": tool_index,
+                            "delta": {"type": "input_json_delta", "partial_json": args},
+                        }
                 yield "content_block_stop", {"type": "content_block_stop", "index": tool_index}
             elif item.get("type") == "message":
                 # Safety net: if streaming deltas never fired (some providers only
