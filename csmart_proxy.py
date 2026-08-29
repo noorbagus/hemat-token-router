@@ -142,7 +142,7 @@ OPENAI_MODEL_PATTERNS = [
     t.strip()
     for t in os.getenv(
         "CSMART_OPENAI_PATTERNS",
-        "gpt-,o1-,o3-,muse-,opencode-,text-,davinci-,curie-",
+        "gpt-,o1-,o3-,muse-,opencode-,text-,davinci-,curie-,deepseek-",
     ).split(",")
     if t.strip()
 ]

@@ -164,11 +164,12 @@ def test_steering_injection_only_openai():
         "max_tokens": 1000,
     }
     cp.sanitize_payload(body_anthropic)
+    original_model = body_anthropic["model"]  # claude-3-5-sonnet-latest — gate pakai model asli (L2331)
     routed_model = cp.route_model_tier(body_anthropic, "test")
     body_anthropic["model"] = routed_model
 
-    # Replicate handle_messages
-    if cp.is_openai_model(routed_model):
+    # Replicate handle_messages: steering gate pakai ORIGINAL model, bukan routed (deepseek-chat kini is_openai)
+    if cp.is_openai_model(original_model):
         steering_block = {"type": "text", "text": cp.SYSTEM_STEERING_PROMPT}
         current_system = body_anthropic.get("system", "")
         if isinstance(current_system, str):
