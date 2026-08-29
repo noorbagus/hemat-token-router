@@ -182,6 +182,6 @@ sequenceDiagram
 | (internal) | middleware gap di csmart_proxy | X-5 |
 | (internal) | retry + first-chunk buffer | X-3, X-4 |
 | `csmart-vs-litellm` | analisis komparatif (analisa, bukan implementasi) | done |
-| `csmart-lite-comparison.md` | perbandingan fork partner (trivnv-at/csmart-lite) — gap dua arah K1-K10 + C1-C3 | done — adopsi K1/K2/K3 pending |
+| `csmart-lite-comparison.md` | perbandingan fork partner (trivnv-at/csmart-lite) — gap dua arah K1-K10 + C1-C3 | done — adopsi K1/K2/K2b/K3/K5/K6/K7/K10 **committed** (2026-08-30) |
 
 **Catatan:** performance metric (Ollama 12.2s, upstream p95 5.99s) **di-defer** ke `arsitektur/perf/` (belum dibuat) — bukan pipeline gap.

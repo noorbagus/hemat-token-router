@@ -2,6 +2,7 @@
 
 > **Status**: catatan perbandingan (2026-08-30). Repo partner: `https://github.com/trivnv-at/csmart-lite` (exclude bagian Ollama, buat laptop tua).
 > Metode: `diff -u csmart_proxy.py csmart-lite/csmart_proxy.py` → **466 insertions / 140 deletions** (dua file ~80% identik, fork dari base yang sama). Kolom Stream/Non-stream = apakah gap aktif di mode itu (❌ = tidak relevan, bukan fixed).
+> **Update 2026-08-30**: K1/K2/K2b/K3/K5/K6/K7/K10 **sudah diadopsi** ke repo kita (lihat §6). C1/C2/T3/W2/W3 tetap di csmart-lite (kirim ke partner). Gap shared X-3..X-10 belum.
 
 ---
 
@@ -74,10 +75,10 @@ csmart-lite = **fork dari `csmart_proxy.py` kita**. Dua-duanya sudah punya **cha
 
 | # | Aksi | Prioritas |
 |---|------|-----------|
-| 1 | **Adopsi K1** (chat tool-history) + **K2** (reasoning→thinking, 4 titik) + **K3** (cache_read, 4 titik) ke repo kita | 🔴 P1 — menutup gap T4 + chat multi-turn |
+| 1 | **Adopsi K1** (chat tool-history) + **K2** (reasoning→thinking, 4 titik) + **K3** (cache_read, 4 titik) ke repo kita | 🔴 P1 — menutup gap T4 + chat multi-turn — **✅ DONE** (commit K-series, `tests/test_adopt_gaps.py` 7 test) |
 | 2 | **Kirim ke partner**: C1/C2/T3/W2/W3 — mereka harus tarik fix ini (W3 security regression wajib) | 🔴 P1 |
-| 3 | **Adopsi K5** (per-model clamp) + **K6** (steering PREPEND anti-fabrication) + K10 (reasoning_effort cap) | 🟡 P2 |
-| 4 | Pertimbangkan K7 (x-api-key), K8 (local .env), K9 (observability) | 🟡 P2 |
+| 3 | **Adopsi K5** (per-model clamp) + **K6** (steering PREPEND anti-fabrication) + K10 (reasoning_effort cap) | 🟡 P2 — **✅ DONE** (TOKEN_CLAMP event verified live: raised_to_floor/lowered_to_ceil/kept/skip_non_int) |
+| 4 | Pertimbangkan K7 (x-api-key), K8 (local .env), K9 (observability) | 🟡 P2 — **K7 ✅ DONE** (verified live: `/v1/messages` 401→200; K8/K9 pending) |
 | 5 | Gap shared X-3..X-10 tetap di pipeline.md (tidak beda antar repo) | — |
 
 ## 7. Referensi
