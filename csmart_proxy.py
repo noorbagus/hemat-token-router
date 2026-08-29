@@ -142,8 +142,8 @@ OPENAI_MODEL_PATTERNS = [
     t.strip()
     for t in os.getenv(
         "CSMART_OPENAI_PATTERNS",
-        "gpt-,o1-,o3-,muse-,opencode-,text-,davinci-,curie-,deepseek-,"
-        "glm-,kimi-,longcat-,mimo-,hy3-,hy4-,grok-",
+        "gpt-,o1-,o3-,muse-,text-,davinci-,curie-,deepseek-,"
+        "glm-,kimi-,longcat-,mimo-,hy3,hy4-,grok-",
     ).split(",")
     if t.strip()
 ]
@@ -160,11 +160,14 @@ OPENAI_RESPONSES_PATH = os.getenv(
 # Model families served by the OpenAI Responses endpoint (/responses) per the
 # OpenCode Go model table. Everything else OpenAI (glm-,kimi-,longcat-,
 # deepseek-,mimo-,hy3-,hy4-,o1-,o3-,text-...) defaults to chat completions.
+# ⚠️ JANGAN tambahkan "opencode-" di sini (atau di OPENAI_MODEL_PATTERNS): itu
+# org prefix "opencode-go/<id>", bukan model family — semua model OpenCode Go
+# bakal ke-hijack ke /responses (lihat kasus opencode-go/hy3 → 502).
 OPENAI_RESPONSES_MODEL_PATTERNS = [
     t.strip()
     for t in os.getenv(
         "CSMART_RESPONSES_PATTERNS",
-        "grok-,gpt-5.6,muse-,opencode-",
+        "grok-,gpt-5.6,muse-",
     ).split(",")
     if t.strip()
 ]

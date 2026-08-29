@@ -568,6 +568,48 @@ def test_openai_model_alias():
     assert cp.OPENAI_MODEL_ALIASES.get("glm-5.3-flash", "glm-5.3-flash") == "glm-5.3-flash"
 
 
+def test_full_opencode_go_model_table_coverage():
+    """Every model id in docs/endpoints-opencode.md must route to the endpoint
+    its row declares: /responses, /chat/completions, or Anthropic-native /messages.
+    Each id is checked BOTH bare and with the ``opencode-go/`` org prefix — the
+    prefix must never change the endpoint (regression: opencode-go/hy3 was
+    hijacked to /responses by the old "opencode-" pattern)."""
+    responses_models = ["grok-4.6", "gpt-5.6-luna", "muse-spark-1.2-contributor"]
+    chat_models = [
+        "glm-5.3-flash", "glm-5.3", "glm-5.2", "glm-5.1",
+        "kimi-k3", "kimi-k2.7-code", "kimi-k2.6",
+        "longcat-2.0",
+        "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp",
+        "mimo-v2.5", "mimo-v2.5-pro",
+        "hy4-preview", "hy3",  # hy3 has no trailing dash — must still match
+    ]
+    native_models = [
+        "minimax-m3", "minimax-m2.7", "minimax-m2.5",
+        "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus",
+    ]
+
+    def route(model: str) -> str:
+        is_native = cp.is_anthropic_native_model(model)
+        is_openai = (not is_native) and cp.is_openai_model(model)
+        if is_native:
+            return "native"
+        if is_openai:
+            return cp.detect_openai_endpoint_type(model)
+        return "unrouted"
+
+    expected = {
+        "responses": responses_models,
+        "chat_completions": chat_models,
+        "native": native_models,
+    }
+    for target, models in expected.items():
+        for m in models:
+            for variant in (m, f"opencode-go/{m}"):
+                assert route(variant) == target, \
+                    f"{variant} -> {route(variant)} (expected {target})"
+    assert len(responses_models) + len(chat_models) + len(native_models) == 26
+
+
 # -----------------------------------------------------------------------------
 # Responses API SSE transform (REAL wire format: delta is a string)
 # -----------------------------------------------------------------------------
