@@ -142,7 +142,8 @@ OPENAI_MODEL_PATTERNS = [
     t.strip()
     for t in os.getenv(
         "CSMART_OPENAI_PATTERNS",
-        "gpt-,o1-,o3-,muse-,opencode-,text-,davinci-,curie-,deepseek-",
+        "gpt-,o1-,o3-,muse-,opencode-,text-,davinci-,curie-,deepseek-,"
+        "glm-,kimi-,longcat-,mimo-,hy3-,hy4-,grok-",
     ).split(",")
     if t.strip()
 ]
@@ -156,6 +157,45 @@ OPENAI_CHAT_COMPLETIONS_PATH = os.getenv(
 OPENAI_RESPONSES_PATH = os.getenv(
     "CSMART_OPENAI_RESPONSES_PATH", "/responses"
 )
+# Model families served by the OpenAI Responses endpoint (/responses) per the
+# OpenCode Go model table. Everything else OpenAI (glm-,kimi-,longcat-,
+# deepseek-,mimo-,hy3-,hy4-,o1-,o3-,text-...) defaults to chat completions.
+OPENAI_RESPONSES_MODEL_PATTERNS = [
+    t.strip()
+    for t in os.getenv(
+        "CSMART_RESPONSES_PATTERNS",
+        "grok-,gpt-5.6,muse-,opencode-",
+    ).split(",")
+    if t.strip()
+]
+# Anthropic-compatible /messages endpoint on the same OpenCode Go base
+# ({OPENAI_BASE_URL}/messages, @ai-sdk/anthropic).
+OPENAI_MESSAGES_PATH = os.getenv("CSMART_OPENAI_MESSAGES_PATH", "/messages")
+
+# Model families served by that Anthropic-compatible /messages endpoint
+# (minimax-m*, qwen3.*). These speak Anthropic-native protocol — NO OpenAI
+# protocol transform, client model name preserved verbatim, raw SSE passthrough.
+ANTHROPIC_NATIVE_MODEL_PATTERNS = [
+    t.strip()
+    for t in os.getenv(
+        "CSMART_ANTHROPIC_NATIVE_PATTERNS",
+        "minimax-,qwen3",
+    ).split(",")
+    if t.strip()
+]
+
+# Model-id aliases applied on the OpenAI path only. OpenCode Go doesn't serve
+# DeepSeek's real API ids (deepseek-chat / deepseek-reasoner — those belong to
+# the DeepSeek upstream passthrough), so map them to OpenCode Go's v4 ids so the
+# documented FLASH/FLAGSHIP defaults keep working when routed to OpenCode Go.
+OPENAI_MODEL_ALIASES: Dict[str, str] = {
+    os.getenv("CSMART_ALIAS_DEEPSEEK_CHAT", "deepseek-chat"): os.getenv(
+        "CSMART_ALIAS_DEEPSEEK_CHAT_TO", "deepseek-v4-flash"
+    ),
+    os.getenv("CSMART_ALIAS_DEEPSEEK_REASONER", "deepseek-reasoner"): os.getenv(
+        "CSMART_ALIAS_DEEPSEEK_REASONER_TO", "deepseek-v4-pro"
+    ),
+}
 
 # System Prompt Steering for OpenAI-native models
 # Instructs model to follow Claude Code tool use format exactly
@@ -769,11 +809,22 @@ def is_openai_model(model_name: str) -> bool:
     return any(pattern.lower() in lower_name for pattern in OPENAI_MODEL_PATTERNS)
 
 
+def is_anthropic_native_model(model_name: str) -> bool:
+    """Detect models served by the Anthropic-compatible /messages endpoint
+    (OpenCode Go: minimax-m*, qwen3.*). These are Anthropic-native — no OpenAI
+    protocol transform, model name preserved verbatim, raw SSE passthrough.
+    Takes precedence over ``is_openai_model`` (a model is one or the other)."""
+    lower_name = model_name.lower()
+    return any(pattern.lower() in lower_name for pattern in ANTHROPIC_NATIVE_MODEL_PATTERNS)
+
+
 def detect_openai_endpoint_type(model_name: str) -> str:
     """Detect which OpenAI endpoint to use (chat_completions or responses)."""
     lower_name = model_name.lower()
-    # OpenCode Go instance uses Responses API for all models
-    if "opencode" in lower_name or "muse" in lower_name:
+    # Responses API families (per OpenCode Go model table): grok-*, gpt-5.6-*,
+    # muse-*, opencode-*. Everything else OpenAI (glm-,kimi-,longcat-,deepseek-,
+    # mimo-,hy3-,hy4-,text-...) is chat completions.
+    if any(pattern.lower() in lower_name for pattern in OPENAI_RESPONSES_MODEL_PATTERNS):
         return "responses"
     if "response" in lower_name or "responses" in lower_name:
         return "responses"
@@ -2328,14 +2379,20 @@ async def handle_messages(request: Request) -> StreamingResponse | JSONResponse:
     # OpenAI detection is based on original model name from client request
     # -------------------------------------------------------------------------
     original_model = body.get("model", "")
-    is_openai = is_openai_model(original_model)
+    # Anthropic-native models (minimax-/qwen3) take precedence: they are served
+    # by OpenCode Go's Anthropic-compatible /messages — not OpenAI protocol.
+    is_anthropic_native = is_anthropic_native_model(original_model)
+    is_openai = (not is_anthropic_native) and is_openai_model(original_model)
     endpoint_type = detect_openai_endpoint_type(original_model) if is_openai else "anthropic"
-    cleaned_model = clean_openai_model_name(original_model) if is_openai else original_model
+    cleaned_model = clean_openai_model_name(original_model)
+    if is_openai:
+        cleaned_model = OPENAI_MODEL_ALIASES.get(cleaned_model, cleaned_model)
 
     _log("OPENAI_DETECTION",
         original_model=original_model,
         cleaned_model=cleaned_model,
         is_openai=is_openai,
+        is_anthropic_native=is_anthropic_native,
         endpoint_type=endpoint_type
     )
 
@@ -2344,7 +2401,12 @@ async def handle_messages(request: Request) -> StreamingResponse | JSONResponse:
     # -------------------------------------------------------------------------
     routed_model = route_model_tier(body, session_key)
     _active_model = routed_model
-    body["model"] = routed_model
+    if is_anthropic_native:
+        # OpenCode Go Anthropic-native: preserve the client model (minimax-m*/qwen3.*).
+        # The tier router would rewrite it to deepseek-chat → 401 upstream.
+        body["model"] = cleaned_model
+    else:
+        body["model"] = routed_model
 
     # -------------------------------------------------------------------------
     # Step 3: System Prompt Steering for OpenAI-native models
@@ -2424,9 +2486,20 @@ async def handle_messages(request: Request) -> StreamingResponse | JSONResponse:
             )
         )
     else:
-        # Anthropic native endpoint includes anthropic-version header
-        headers = _upstream_headers(request)
-        upstream_url = f"{UPSTREAM_BASE_URL}/v1/messages"
+        if is_anthropic_native:
+            # OpenCode Go Anthropic-compatible /messages: passthrough with the
+            # client model preserved; Anthropic endpoints need x-api-key (K7).
+            headers = {
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "x-api-key": OPENAI_API_KEY,
+                "Content-Type": "application/json",
+                "anthropic-version": request.headers.get("anthropic-version", "2023-06-01"),
+            }
+            upstream_url = f"{OPENAI_BASE_URL}{OPENAI_MESSAGES_PATH}"
+        else:
+            # DeepSeek Anthropic-native endpoint includes anthropic-version header
+            headers = _upstream_headers(request)
+            upstream_url = f"{UPSTREAM_BASE_URL}/v1/messages"
         transformed_body = body
 
     # Debug: dump the exact upstream request once per env flag (CSMART_DUMP_BODY=1)

@@ -424,6 +424,59 @@ async def test_e2e_backward_compatibility_anthropic():
 
 
 @pytest.mark.asyncio
+async def test_e2e_anthropic_native_passthrough(monkeypatch):
+    """minimax/qwen3 are Anthropic-native on OpenCode Go /messages: the client
+    model name must be preserved (NOT rewritten to deepseek-chat), routed to
+    ``{OPENAI_BASE_URL}/messages`` with the OpenCode key + x-api-key, and the
+    Anthropic SSE streamed back verbatim (no protocol transform)."""
+    monkeypatch.setattr(cp, "OPENAI_API_KEY", "test-opencode-key-never-leaked")
+    calls: list[httpx.Request] = []
+    upstream_text = "Hello from minimax (Anthropic native)!"
+
+    def native_handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        events = [
+            {"type": "message_start", "message": {"role": "assistant", "content": []}},
+            {"type": "content_block_delta", "delta": {"type": "text", "text": upstream_text}},
+            {"type": "message_stop"},
+        ]
+        body = b"".join(
+            f"event: {e['type']}\ndata: {json.dumps(e)}\n\n".encode("utf-8")
+            for e in events
+        )
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    _mock_upstream(native_handler)
+
+    payload: dict[str, Any] = {
+        "model": "opencode-go/minimax-m3",
+        "messages": [{"role": "user", "content": "Say hello"}],
+        "max_tokens": 100,
+    }
+
+    transport = httpx.ASGITransport(app=cp.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await _post(client, payload)
+
+    assert resp.status_code == 200
+    content = resp.text
+    assert "message_start" in content and "message_stop" in content
+    assert upstream_text in content
+
+    assert len(calls) == 1
+    upstream_req = calls[0]
+    # Route to OpenCode Go Anthropic /messages — NOT the DeepSeek upstream.
+    assert upstream_req.url.path == f"{cp.OPENAI_MESSAGES_PATH}".lstrip("/") or \
+        upstream_req.url.path.endswith(cp.OPENAI_MESSAGES_PATH)
+    # Model preserved verbatim (stripped of opencode-go/ prefix), NOT deepseek-chat.
+    body_model = json.loads(upstream_req.content).get("model")
+    assert body_model == "minimax-m3", f"model not preserved: {body_model}"
+    # Anthropic endpoints need x-api-key (K7), using the OpenCode key.
+    assert upstream_req.headers.get("x-api-key") == "test-opencode-key-never-leaked"
+    assert upstream_req.headers.get("authorization") == "Bearer test-opencode-key-never-leaked"
+
+
+@pytest.mark.asyncio
 async def test_openai_client_key_not_forwarded(monkeypatch):
     """Test that client Authorization header is never forwarded to upstream (same as Anthropic)."""
     # Pin server-side OpenAI key so the test is hermetic (no real key in assertions)
@@ -473,6 +526,46 @@ def test_detect_endpoint_type():
     # OpenCode models (muse/opencode) use the Responses API
     assert cp.detect_openai_endpoint_type("muse-spark-1.2") == "responses"
     assert cp.detect_openai_endpoint_type("opencode-go/muse-spark-1.2-contributor") == "responses"
+    # OpenCode Go table: grok/gpt-5.6 on /responses
+    assert cp.detect_openai_endpoint_type("grok-4.6") == "responses"
+    assert cp.detect_openai_endpoint_type("opencode-go/gpt-5.6-luna") == "responses"
+    # OpenCode Go table: glm/kimi/longcat/mimo/hy on /chat/completions
+    assert cp.detect_openai_endpoint_type("glm-5.3-flash") == "chat_completions"
+    assert cp.detect_openai_endpoint_type("kimi-k2.5") == "chat_completions"
+    assert cp.detect_openai_endpoint_type("deepseek-v4-flash") == "chat_completions"
+
+
+def test_anthropic_native_detection():
+    """minimax/qwen3 are Anthropic-native (OpenCode Go /messages) — NOT OpenAI,
+    so they must not be protocol-transformed and must not take the FLASH rewrite.
+    NB: ``opencode-go/minimax-m3`` matches BOTH ``opencode-`` (OpenAI pattern)
+    and ``minimax-`` (native) — handle_messages resolves via precedence (native
+    wins). This is the effective decision, not the raw ``is_openai_model``."""
+    for model in ("minimax-m3", "minimax-m2", "opencode-go/minimax-m3", "qwen3.8-flash", "qwen3-8b"):
+        assert cp.is_anthropic_native_model(model), f"{model} should be anthropic-native"
+        effective_openai = (not cp.is_anthropic_native_model(model)) and cp.is_openai_model(model)
+        assert effective_openai is False, f"{model} must not be treated as OpenAI"
+    # claude models are neither OpenAI nor OpenCode-native
+    assert cp.is_anthropic_native_model("claude-3-5-sonnet-latest") is False
+    assert cp.is_anthropic_native_model("muse-spark-1.2-contributor") is False
+
+
+def test_openai_model_alias():
+    """DeepSeek's real API ids aren't served by OpenCode Go — they must map to
+    OpenCode Go's v4 ids on the OpenAI path so the documented FLASH/FLAGSHIP
+    defaults (deepseek-chat / deepseek-reasoner) keep working."""
+    assert cp.OPENAI_MODEL_ALIASES["deepseek-chat"] == "deepseek-v4-flash"
+    assert cp.OPENAI_MODEL_ALIASES["deepseek-reasoner"] == "deepseek-v4-pro"
+    # Alias applies to the *cleaned* model (after opencode-go/ prefix strip).
+    for raw, expected in [
+        ("deepseek-chat", "deepseek-v4-flash"),
+        ("opencode-go/deepseek-chat", "deepseek-v4-flash"),
+        ("deepseek-reasoner", "deepseek-v4-pro"),
+    ]:
+        cleaned = cp.clean_openai_model_name(raw)
+        assert cp.OPENAI_MODEL_ALIASES.get(cleaned, cleaned) == expected
+    # Non-aliased models pass through untouched.
+    assert cp.OPENAI_MODEL_ALIASES.get("glm-5.3-flash", "glm-5.3-flash") == "glm-5.3-flash"
 
 
 # -----------------------------------------------------------------------------
