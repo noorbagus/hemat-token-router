@@ -1,9 +1,9 @@
 # csmart Pipeline — Diagram & Checklist
 
-> Source: `csmart_proxy.py` (standalone v3, jalan di `127.0.0.1:18080`) + `router/` (CLI mode)
-> Upstream aktif: `https://opencode.ai/zen/go/v1` (Responses-only) via `muse-spark-1.2-contributor`
-> Bukti: `~/.csmart/logs/session_20260829.jsonl` (request 22:39:34 UTC, 37 tools, text 39 chars)
-> Update terakhir: 2026-08-29
+> Source: `csmart_proxy.py` (standalone v3, jalan di `127.0.0.1:8080`) + `router/` (CLI mode)
+> Upstream aktif: `https://opencode.ai/zen/go/v1` — **3 endpoint** (`/responses`, `/chat/completions`, `/messages`) untuk full 33-model set OpenCode Go
+> Bukti: `~/.csmart/logs/session_20260830.jsonl` (full model matrix 200: gpt-5.6-luna, minimax-m3, qwen3.8-flash, glm-5.3-flash, deepseek-chat)
+> Update terakhir: 2026-08-30
 
 **Terminologi:**
 - **Pipeline bottleneck** = stage yang **missing / broken / blocking downstream** (functional gap)
@@ -61,8 +61,8 @@ flowchart LR
 |---|-------|-----------|--------|-----------------|-------|
 | **1** | **INBOUND** receive | `csmart_proxy.py:1721` | 🟠 X | 0 middleware (loopback/rate-limit/body-cap) | `dispatcher.py:876` punya, **tidak di-port** ke csmart_proxy |
 | **2** | JSON parse + **DLP sanitize** | `:1726, :517` | 🟠 X | silent — tidak emit log event | `sanitize_payload` return None, counter tidak dikirim |
-| **3** | OpenAI detect | `:706, :712, :697` | 🟢 ok | — | `INBOUND_REQUEST` log: `is_openai:true, endpoint_type:responses` |
-| **4** | **Tier route** flash/flagship | `:680` | 🟢 ok | — | Heuristic keyword → `deepseek-chat` (flash) / `deepseek-reasoner` (flagship) |
+| **3** | Model detect | `:812, :821` | 🟢 ok | — | 3-way: `is_openai` (chat/responses) vs `is_anthropic_native` (minimax/qwen → passthrough `/messages`) vs regular Anthropic (DeepSeek) |
+| **4** | **Tier route** flash/flagship | `:780` | 🟢 ok | — | Heuristic keyword → flash/flagship; **native model dipertahankan** (skip FLASH rewrite) |
 | **5** | **Steering inject** (OpenAI only) | `:1766-1784` | 🟢 ok | — | Append `SYSTEM_STEERING_PROMPT` ke `body.system` |
 | **6** | **3-region prefix align** | `:621` | 🟢 ok | — | Cache stability untuk KV-cache hit di upstream |
 | **7** | **Request transform** Anthropic→Responses | `:901` | 🟢 ok | — | `OPENAI_REQUEST_TRANSFORM` log: `upstream_url:opencode.ai/zen/go/v1/responses` |

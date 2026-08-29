@@ -148,6 +148,22 @@ Gateway credentials loaded from: `/Volumes/Xugab/LAB/PrivateLink/credentials/.en
   - `effort_level: low`
 - Catatan: DeepSeek API key disimpan sebagai `ANTHROPIC_AUTH_TOKEN` di `/Volumes/Xugab/LAB/PrivateLink/.env.local` (bukan `credentials/.env`). Jalur CLI (`cli_dispatch.py`) load kedua file env. Upstream default proxy di-override via env `ANTHROPIC_UPSTREAM_URL`.
 
+### OpenCode Go Multi-Model Routing (proxy `csmart_proxy.py`)
+
+Proxy support full model set OpenCode Go lewat **3 endpoint** (dipilih per-request dari `body.model`):
+
+| Endpoint | Model families | Env override |
+|---|---|---|
+| `/responses` (OpenAI Responses) | `grok-`, `gpt-5.6-`, `muse-`, `opencode-` | `CSMART_RESPONSES_PATTERNS` |
+| `/chat/completions` (OpenAI Chat) | `glm-`, `kimi-`, `longcat-`, `deepseek-`, `mimo-`, `hy3-`, `hy4-`, `o1-`, `o3-`, `text-`, `davinci-`, `curie-` | `CSMART_OPENAI_PATTERNS` |
+| `/messages` (Anthropic-native, base yang sama) | `minimax-`, `qwen3` | `CSMART_ANTHROPIC_NATIVE_PATTERNS` |
+
+- Key terpisah: `OPENAI_API_KEY` untuk `OPENAI_BASE_URL` (default `https://opencode.ai/zen/go/v1`); `ANTHROPIC_AUTH_TOKEN` untuk DeepSeek passthrough.
+- Model id `opencode-go/<id>` di-strip prefix-nya (`clean_openai_model_name`) sebelum dikirim upstream.
+- Model Anthropic-native (minimax/qwen) di-**passthrough mentah**: nama model dipertahankan (skip FLASH rewrite), tanpa protocol transform, butuh `x-api-key` (K7) + `OPENAI_API_KEY`.
+- Alias id: `deepseek-chat`→`deepseek-v4-flash`, `deepseek-reasoner`→`deepseek-v4-pro` (id asli DeepSeek tidak ada di OpenCode Go → 401). Override via `CSMART_ALIAS_DEEPSEEK_CHAT[_TO]` / `CSMART_ALIAS_DEEPSEEK_REASONER[_TO]`.
+- Satu port (default `8080`) layani semua model — verifikasi live: muse/deepseek/gpt-5.6-luna/minimax/qwen/glm semuanya 200.
+
 ## Aturan untuk AI Coding Tools (CLAUDE.md ini dibaca sebelum edit)
 
 1. **JANGAN** ubah dependency dari `tree-sitter-language-pack` balik ke `tree-sitter-languages` - that's the Python 3.14 blocker we fixed
