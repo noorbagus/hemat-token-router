@@ -154,9 +154,11 @@ Proxy support full model set OpenCode Go lewat **3 endpoint** (dipilih per-reque
 
 | Endpoint | Model families | Env override |
 |---|---|---|
-| `/responses` (OpenAI Responses) | `grok-`, `gpt-5.6-`, `muse-`, `opencode-` | `CSMART_RESPONSES_PATTERNS` |
-| `/chat/completions` (OpenAI Chat) | `glm-`, `kimi-`, `longcat-`, `deepseek-`, `mimo-`, `hy3-`, `hy4-`, `o1-`, `o3-`, `text-`, `davinci-`, `curie-` | `CSMART_OPENAI_PATTERNS` |
+| `/responses` (OpenAI Responses) | `grok-`, `gpt-5.6-`, `muse-` | `CSMART_RESPONSES_PATTERNS` |
+| `/chat/completions` (OpenAI Chat) | `glm-`, `kimi-`, `longcat-`, `deepseek-`, `mimo-`, `hy3`, `hy4-`, `o1-`, `o3-`, `text-`, `davinci-`, `curie-`, `gpt-` | `CSMART_OPENAI_PATTERNS` |
 | `/messages` (Anthropic-native, base yang sama) | `minimax-`, `qwen3` | `CSMART_ANTHROPIC_NATIVE_PATTERNS` |
+
+⚠️ **JANGAN pakai `opencode-` sebagai pattern** — itu org prefix (`opencode-go/<id>`), bukan model family; semua id ber-prefix bakal ke-hijack ke `/responses` (bug `opencode-go/hy3` → 502). `hy3` tanpa dash sengaja (id-nya `hy3`).
 
 - Key terpisah: `OPENAI_API_KEY` untuk `OPENAI_BASE_URL` (default `https://opencode.ai/zen/go/v1`); `ANTHROPIC_AUTH_TOKEN` untuk DeepSeek passthrough.
 - Model id `opencode-go/<id>` di-strip prefix-nya (`clean_openai_model_name`) sebelum dikirim upstream.
