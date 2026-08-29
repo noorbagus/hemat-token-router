@@ -1,14 +1,14 @@
 {
   ".claude/settings.local.json": {
-    "mtime": 1787929427.0,
-    "seen": 1787930032.350424,
-    "ast_hash": "5b2aeb607d68e9adeba108701147a2a5",
+    "mtime": 1787936551.0,
+    "seen": 1787936704.725622,
+    "ast_hash": "7f058cd6f1859e9c6a8cd3ca29c81252",
     "semantic_hash": ""
   },
   "csmart.py": {
-    "mtime": 1787929623.0,
-    "seen": 1787930032.350427,
-    "ast_hash": "e4471ab197a5139ca697d5e5d6934a09",
+    "mtime": 1787936525.0,
+    "seen": 1787936704.725625,
+    "ast_hash": "3798f8f27b89cca12c691ec057d4afca",
     "semantic_hash": ""
   },
   "pyproject.toml": {
@@ -24,33 +24,33 @@
     "semantic_hash": ""
   },
   "router/ast_extractor.py": {
-    "mtime": 1787929474.0,
-    "seen": 1787930032.350433,
-    "ast_hash": "50f95dc94fc814c4362531041f687c81",
+    "mtime": 1787935280.0,
+    "seen": 1787936704.725635,
+    "ast_hash": "9024430e2928e796b10af41f76813dd2",
     "semantic_hash": ""
   },
   "router/cli_dispatch.py": {
-    "mtime": 1787929615.0,
-    "seen": 1787930032.350435,
-    "ast_hash": "388110264fc813ee07852b581730b9a0",
+    "mtime": 1787933270.0,
+    "seen": 1787936704.725636,
+    "ast_hash": "acaa75fca59ea8713e4dd35f4776caa1",
     "semantic_hash": ""
   },
   "router/dispatcher.py": {
-    "mtime": 1787929772.0,
-    "seen": 1787930032.3504362,
-    "ast_hash": "886f95c4870127922d077042ec69f0ef",
+    "mtime": 1787939673.0,
+    "seen": 1787946505.131819,
+    "ast_hash": "bee3c27fbf6674fb954815064e551110",
     "semantic_hash": ""
   },
   "router/gate.py": {
-    "mtime": 1787929533.0,
-    "seen": 1787930032.3504372,
-    "ast_hash": "503776314333d779a6612dc3a6013780",
+    "mtime": 1787936490.0,
+    "seen": 1787936704.7256372,
+    "ast_hash": "1f60ce43392c2c714ca234b02b4eed84",
     "semantic_hash": ""
   },
   "router/logger.py": {
-    "mtime": 1787929229.0,
-    "seen": 1787929419.640078,
-    "ast_hash": "6b9605a1f4cb69c1dedabb2e9b54cedd",
+    "mtime": 1787939673.0,
+    "seen": 1787946505.131822,
+    "ast_hash": "2e562ee8226c7e6c6536d7920c765564",
     "semantic_hash": ""
   },
   "router/logs_viewer.py": {
@@ -60,15 +60,15 @@
     "semantic_hash": ""
   },
   "router/ollama_scorer.py": {
-    "mtime": 1787929501.0,
-    "seen": 1787930032.35044,
-    "ast_hash": "29a352c3a7494aed5069791d2b1fbaa3",
+    "mtime": 1787937924.0,
+    "seen": 1787946505.131824,
+    "ast_hash": "d231019cf0e64d010d8b1959d6dc0fdd",
     "semantic_hash": ""
   },
   "router/report.py": {
-    "mtime": 1787854067.0,
-    "seen": 1787929123.840849,
-    "ast_hash": "fecaedefb0cf16c7ce6affae92c39703",
+    "mtime": 1787935298.0,
+    "seen": 1787936704.725642,
+    "ast_hash": "418a35ecb0a692f508f08e7d0738e122",
     "semantic_hash": ""
   },
   "router/routing_cache.py": {
@@ -108,33 +108,33 @@
     "semantic_hash": ""
   },
   "tests/test_ast_extractor.py": {
-    "mtime": 1787929503.0,
-    "seen": 1787930032.3504481,
-    "ast_hash": "86235e59d7fddc1c134fcca8d8033c59",
+    "mtime": 1787935369.0,
+    "seen": 1787936704.725656,
+    "ast_hash": "b2f194d6e178754da42efc7b448154e7",
     "semantic_hash": ""
   },
   "tests/test_cli.py": {
-    "mtime": 1787929638.0,
-    "seen": 1787930032.3504488,
-    "ast_hash": "7bcc7a8e5d23a6dec521cab8b1ae1125",
+    "mtime": 1787936249.0,
+    "seen": 1787936704.725657,
+    "ast_hash": "fcb2884d4cd4612a5c7b2bc7099233be",
     "semantic_hash": ""
   },
   "tests/test_gate.py": {
-    "mtime": 1787929559.0,
-    "seen": 1787930032.35045,
-    "ast_hash": "833bee675f761cf2bd18c3042739456f",
+    "mtime": 1787936535.0,
+    "seen": 1787936704.7256582,
+    "ast_hash": "4242197ffe473fed7515c6821cd094ee",
     "semantic_hash": ""
   },
   "tests/test_logger.py": {
-    "mtime": 1787929258.0,
-    "seen": 1787929419.640091,
-    "ast_hash": "6bf6b007aad7a29561951f943bc879bb",
+    "mtime": 1787939673.0,
+    "seen": 1787946505.1318579,
+    "ast_hash": "6b410e6cb5a388e3c2e6d4c989d92cf4",
     "semantic_hash": ""
   },
   "tests/test_logs_viewer.py": {
-    "mtime": 1787853583.0,
-    "seen": 1787929123.8408582,
-    "ast_hash": "1a5bd7ae8f20a017b570fe88b0564565",
+    "mtime": 1787933277.0,
+    "seen": 1787936704.7256598,
+    "ast_hash": "4e83f4790c59cb62a3528750c08917cb",
     "semantic_hash": ""
   },
   "tests/test_ollama_scorer.py": {
@@ -144,9 +144,9 @@
     "semantic_hash": ""
   },
   "tests/test_proxy.py": {
-    "mtime": 1787863519.0,
-    "seen": 1787929123.840859,
-    "ast_hash": "7fb66a15e3b4afa386888f0b51f13f9d",
+    "mtime": 1787936258.0,
+    "seen": 1787936704.725662,
+    "ast_hash": "acca41dbe67d36f86679ac295e3733ec",
     "semantic_hash": ""
   },
   "tests/test_proxy_inject.py": {
@@ -156,15 +156,15 @@
     "semantic_hash": ""
   },
   "tests/test_proxy_server.py": {
-    "mtime": 1787929866.0,
-    "seen": 1787930032.350456,
-    "ast_hash": "c146ca2605dc29e12546581c4b5154a4",
+    "mtime": 1787939673.0,
+    "seen": 1787946505.1318789,
+    "ast_hash": "39985f47c30240a23ef73cc7a8f2b3fa",
     "semantic_hash": ""
   },
   "tests/test_report.py": {
-    "mtime": 1787854123.0,
-    "seen": 1787929123.8408608,
-    "ast_hash": "e36b2cf20b9760e33a742c2fd49ce246",
+    "mtime": 1787936222.0,
+    "seen": 1787936704.725664,
+    "ast_hash": "024fa9213befebe3926a2b4c28e2cae6",
     "semantic_hash": ""
   },
   "tests/test_safe_path.py": {
@@ -186,15 +186,15 @@
     "semantic_hash": ""
   },
   "CLAUDE.md": {
-    "mtime": 1787929901.0,
-    "seen": 1787930032.350462,
-    "ast_hash": "b9fbb9a6757d6692bb7b91a0b427e6a3",
+    "mtime": 1787933284.0,
+    "seen": 1787936704.725674,
+    "ast_hash": "dd40b329a8e6e1470622543515955434",
     "semantic_hash": ""
   },
   "CONTRACTS.md": {
-    "mtime": 1787929488.0,
-    "seen": 1787930032.350462,
-    "ast_hash": "8d73ce10da8af428efe3e80d2adf0da8",
+    "mtime": 1787939673.0,
+    "seen": 1787946505.131902,
+    "ast_hash": "8cb98ab90072dae12dbf9abc97b08189",
     "semantic_hash": ""
   },
   "DEVELOPMENT.md": {
@@ -243,6 +243,42 @@
     "mtime": 1787929585.0,
     "seen": 1787930032.3504581,
     "ast_hash": "d4f0743f837e23f18350a90c1ea3b4fd",
+    "semantic_hash": ""
+  },
+  "router/http_utils.py": {
+    "mtime": 1787934317.0,
+    "seen": 1787936704.725638,
+    "ast_hash": "8f32e77b6a042891caa48e15acf4693d",
+    "semantic_hash": ""
+  },
+  "router/shadow_loop.py": {
+    "mtime": 1787934411.0,
+    "seen": 1787936704.725646,
+    "ast_hash": "fa17cc281bf03fa29c7fd8ccce767388",
+    "semantic_hash": ""
+  },
+  "router/sse_stream.py": {
+    "mtime": 1787934325.0,
+    "seen": 1787936704.7256472,
+    "ast_hash": "4236f64daeecbe56a54aade1b4ff66c7",
+    "semantic_hash": ""
+  },
+  "csmart_proxy.py": {
+    "mtime": 1787953004.0,
+    "seen": 1787953174.9707131,
+    "ast_hash": "6826fbf09b09b6d728d99b9350c2ba58",
+    "semantic_hash": ""
+  },
+  "tests/test_csmart_proxy.py": {
+    "mtime": 1787946211.0,
+    "seen": 1787946505.131856,
+    "ast_hash": "f3192257dddc2264c66be63a7f74eeba",
+    "semantic_hash": ""
+  },
+  "tests/test_csmart_proxy_openai.py": {
+    "mtime": 1787953052.0,
+    "seen": 1787953174.970737,
+    "ast_hash": "51863c7176382b930ec6764c5e292144",
     "semantic_hash": ""
   }
 }
