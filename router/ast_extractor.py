@@ -119,7 +119,7 @@ def extract_ast_skeleton(file_path: str) -> str:
         return ""
 
 
-def scan_project_codebase(root_dir: str, ignore_dirs: set[str]) -> list[str]:
+def scan_project_codebase(root_dir: str, ignore_dirs: set[str]) -> tuple[list[str], int]:
     """Scan a project directory recursively for supported source files,
     extracting AST skeletons.
 
@@ -128,13 +128,18 @@ def scan_project_codebase(root_dir: str, ignore_dirs: set[str]) -> list[str]:
         ignore_dirs: Set of directory names to ignore (e.g. {".git", "__pycache__"}).
 
     Returns:
-        List of skeletons (strings), one per supported file.
+        Tuple of ``(skeletons, full_codebase_bytes)``: the list of skeletons
+        (one per supported file) plus the total size in bytes of every
+        supported source file encountered. The byte total is the "full
+        codebase" baseline used to estimate tokens saved vs. the injected
+        context.
     """
     start = time.monotonic()
     skeletons: list[str] = []
     root_path = Path(root_dir)
     files_encountered = 0
     parse_failures = 0
+    full_codebase_bytes = 0
 
     for dirpath, dirnames, filenames in os.walk(root_path):
         # Filter out ignored directories (modify in-place for os.walk)
@@ -147,19 +152,26 @@ def scan_project_codebase(root_dir: str, ignore_dirs: set[str]) -> list[str]:
 
             files_encountered += 1
             file_path = Path(dirpath) / filename
+            try:
+                full_codebase_bytes += file_path.stat().st_size
+            except OSError:
+                pass
             skeleton = extract_ast_skeleton(str(file_path))
             if skeleton:
                 skeletons.append(skeleton)
             else:
                 parse_failures += 1
 
+    skeleton_bytes = sum(len(s.encode("utf-8")) for s in skeletons)
     logger.log(
         AST_SCANNED,
         root_dir=str(root_dir),
         scanned_files_count=len(skeletons),
         files_encountered=files_encountered,
         parse_failures=parse_failures,
+        full_codebase_bytes=full_codebase_bytes,
+        skeleton_bytes=skeleton_bytes,
         duration_ms=int((time.monotonic() - start) * 1000),
     )
 
-    return skeletons
+    return skeletons, full_codebase_bytes

@@ -44,22 +44,21 @@ from router.logger import (
     CONTEXT_INJECTED,
     IMPORT_EXPANSION,
     INBOUND_REQUEST,
+    MODEL_ROUTED,
     OLLAMA_HEALTH,
     PASSTHROUGH,
-    SSE_STREAM_COMPLETE,
-    TOOL_SHADOW_INTERCEPT,
+    TOKEN_SAVINGS,
     UPSTREAM_HEALTH,
     UPSTREAM_RETRY,
     logger,
 )
+from router.http_utils import _build_upstream_headers
 from router.ollama_scorer import RoutingResult, triage_model
 from router.routing_cache import LRURoutingCache, TTLRoutingCache
 from router.safe_path import PathTraversalError, resolve_under_base
-from router.tool_shadow import (
-    TOOL_NAMES,
-    execute_local_tool,
-    summarize_exploration,
-)
+from router.shadow_loop import ShadowStreamer
+from router.sse_stream import _iter_sse_events
+from router.tool_shadow import TOOL_NAMES
 
 # Backward-compat re-exports for the merge window (orchestrator repoints csmart.py).
 from router.cli_dispatch import DispatchResult, dispatch_claude, read_file_content
@@ -70,6 +69,7 @@ from router.cli_dispatch import DispatchResult, dispatch_claude, read_file_conte
 
 UPSTREAM_BASE_URL = os.environ.get("ANTHROPIC_UPSTREAM_URL", "https://api.deepseek.com/anthropic")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:7b")
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 CONFIDENCE_THRESHOLD = float(os.environ.get("CSMART_THRESHOLD", "0.65"))
 DEFAULT_BUDGET_TOKENS = int(os.environ.get("CSMART_BUDGET", "16000"))
 DEFAULT_IGNORE_DIRS: set[str] = {
@@ -100,7 +100,7 @@ _UPSTREAM_TRANSPORT: Optional[httpx.AsyncBaseTransport] = None
 # Caches (P-1): AST cache keyed by context_dir, routing cache keyed by session.
 # ---------------------------------------------------------------------------
 
-_AST_CACHE: Dict[str, List[str]] = {}
+_AST_CACHE: Dict[str, tuple[List[str], int]] = {}
 _AST_CACHE_LOCK = threading.Lock()
 # Routing caches delegate to the tested classes in ``router.routing_cache``
 # (P-1 session LRU + P-0 context-dir TTL). Global names are kept stable so the
@@ -151,48 +151,6 @@ def _clamp_max_tokens(body: Dict[str, Any]) -> None:
 def _context_dir() -> str:
     """Root directory for AST scan / local tool execution."""
     return os.environ.get("CSMART_CONTEXT_DIR", ".")
-
-
-# S-1 header whitelist: only allowlisted headers are forwarded upstream.
-# ``x-api-key`` deliberately stays in the default allowlist (deviation from the
-# original plan, which would have stripped it): the Anthropic SDK can send auth
-# either as ``Authorization: Bearer`` (``ANTHROPIC_AUTH_TOKEN``) or as
-# ``x-api-key`` (``ANTHROPIC_API_KEY``), and the proxy has no token-injection
-# mechanism, so it forwards whichever the client sends. Live-verified
-# 2026-08-28: the ``ark.talaga.my.id`` gateway REQUIRES ``authorization`` and
-# rejects ``x-api-key`` (401), so Claude Code must set ``ANTHROPIC_AUTH_TOKEN``
-# (Bearer), not ``ANTHROPIC_API_KEY``. The real hardening win is stripping
-# ``cookie``, ``user-agent``, ``sec-*``, ``referer``, ``origin`` and every other
-# non-allowlisted header (including the internal ``x-csmart-session``, which
-# stays local). An operator can drop ``x-api-key`` via
-# ``CSMART_HEADER_ALLOWLIST`` if their gateway accepts only ``authorization``.
-_DEFAULT_HEADER_ALLOWLIST = frozenset({
-    "authorization", "x-api-key", "content-type", "accept",
-    "anthropic-version", "anthropic-beta", "x-app",
-})
-
-
-def _header_allowlist() -> frozenset[str]:
-    raw = os.environ.get("CSMART_HEADER_ALLOWLIST")
-    if not raw:
-        return _DEFAULT_HEADER_ALLOWLIST
-    return frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
-
-
-def _build_upstream_headers(request: Request) -> Dict[str, str]:
-    """Copy only allowlisted client headers upstream (S-1 header whitelist).
-
-    ``content-encoding`` is deliberately NOT forwarded (NIT): Claude Code sends
-    uncompressed JSON bodies, and forwarding a compressed body without the
-    matching header would corrupt the upstream read. If a client ever sends an
-    encoded body it is rejected/decoded downstream before it is re-sent.
-    """
-    allow = _header_allowlist()
-    headers: Dict[str, str] = {}
-    for name, value in request.headers.items():
-        if name.lower() in allow:
-            headers[name] = value
-    return headers
 
 
 # P-5 request body cap: reject oversized bodies before routing/forwarding.
@@ -561,25 +519,30 @@ def _expand_selected_with_imports(
     return ordered
 
 
-async def _get_or_scan_ast(context_dir: str) -> List[str]:
-    """Scan the project once per context_dir (cached). Non-blocking (P-2)."""
+async def _get_or_scan_ast(context_dir: str) -> tuple[List[str], int]:
+    """Scan the project once per context_dir (cached). Non-blocking (P-2).
+
+    Returns ``(skeletons, full_codebase_bytes)``; the byte total is cached
+    alongside the skeletons so the token-savings baseline survives cache hits.
+    """
     key = os.path.abspath(context_dir)
     with _AST_CACHE_LOCK:
         cached = _AST_CACHE.get(key)
     if cached is not None:
+        skeletons, full_codebase_bytes = cached
         logger.log(
             AST_CACHE_HIT,
             context_dir=context_dir,
-            scanned_files_count=len(cached),
+            scanned_files_count=len(skeletons),
             cache_size=len(_AST_CACHE),
         )
-        return cached
-    skeletons = await asyncio.to_thread(
+        return skeletons, full_codebase_bytes
+    skeletons, full_codebase_bytes = await asyncio.to_thread(
         ast_extractor.scan_project_codebase, context_dir, DEFAULT_IGNORE_DIRS
     )
     with _AST_CACHE_LOCK:
-        _AST_CACHE[key] = skeletons
-    return skeletons
+        _AST_CACHE[key] = (skeletons, full_codebase_bytes)
+    return skeletons, full_codebase_bytes
 
 
 def _truncate_routing_prompt(prompt: str, max_chars: int | None = None) -> str:
@@ -657,7 +620,7 @@ async def run_local_routing(
     reuse the routing via the context-dir TTL cache (P-0) instead of re-routing
     every message (AST is still cached either way).
     """
-    skeletons = await _get_or_scan_ast(context_dir)
+    skeletons, full_codebase_bytes = await _get_or_scan_ast(context_dir)
     full_skeleton = _cap_skeleton("\n".join(skeletons))
 
     if session_key:
@@ -684,12 +647,33 @@ async def run_local_routing(
 
     # apply_gate takes tokens (it converts to bytes internally); the old `* 4`
     # passed bytes-as-tokens, making the budget 4x too lenient (review MAJOR).
-    gate_result = await asyncio.to_thread(
-        apply_gate,
-        routing,
-        CONFIDENCE_THRESHOLD,
-        DEFAULT_BUDGET_TOKENS,
-        base_dir=context_dir,
+    # Empty routing input would raise ValueError; surface it as a blocked gate.
+    if not routing.target_files:
+        gate_result = GateResult(
+            status="blocked",
+            selected_files=[],
+            selected_bytes=0,
+            estimated_tokens=0,
+            dropped_count=0,
+            reason="No candidate files provided by routing.",
+        )
+    else:
+        gate_result = await asyncio.to_thread(
+            apply_gate,
+            routing,
+            CONFIDENCE_THRESHOLD,
+            DEFAULT_BUDGET_TOKENS,
+            base_dir=context_dir,
+        )
+
+    injected_bytes = gate_result.selected_bytes
+    tokens_saved = max(0, (full_codebase_bytes - injected_bytes) // 4)
+    logger.log(
+        TOKEN_SAVINGS,
+        full_codebase_bytes=full_codebase_bytes,
+        injected_bytes=injected_bytes,
+        estimated_tokens_saved=tokens_saved,
+        gate_status=gate_result.status,
     )
     return gate_result
 
@@ -735,411 +719,65 @@ async def _request_upstream(
             )
             await asyncio.sleep(0.25 * attempts)
 
-
 # ---------------------------------------------------------------------------
-# SSE parsing (N-3).
+# Upstream SSE source: performs the HTTP request and parses the response into
+# ``(event_name, payload)`` tuples. Owns the transport hook, the ``>= 400``
+# status check and mid-stream transport error mapping; on any failure it yields
+# a single ``error`` SSE event with the same payloads the pre-extraction inline
+# handling produced (CONTRACTS.md §2 frozen).
 # ---------------------------------------------------------------------------
 
 
-def _parse_sse_data(data_lines: List[str]) -> Dict[str, Any]:
-    """Join ``data:`` lines and JSON-decode them into a payload dict."""
-    raw = "\n".join(data_lines)
+async def _sse_source(
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    body: Dict[str, Any],
+) -> AsyncGenerator[Tuple[Optional[str], Dict[str, Any]], None]:
     try:
-        payload = json.loads(raw)
-        if isinstance(payload, dict):
-            return payload
-        return {
+        client, resp = await _request_upstream(method, url, headers, body)
+    except UpstreamError as exc:
+        yield "error", {
             "type": "error",
-            "error": {"type": "invalid_payload", "message": raw[:200]},
+            "error": {"type": "api_error", "message": str(exc)},
         }
-    except json.JSONDecodeError:
-        return {
-            "type": "error",
-            "error": {"type": "invalid_json", "message": raw[:200]},
-        }
-
-
-async def _iter_sse_events(resp: httpx.Response) -> AsyncGenerator[Tuple[Optional[str], Dict[str, Any]], None]:
-    """Parse an httpx streaming response into ``(event_name, payload)`` tuples."""
-    data_lines: List[str] = []
-    event_name: Optional[str] = None
-    async for raw_line in resp.aiter_lines():
-        line = raw_line.rstrip("\r")
-        if line == "":
-            if data_lines:
-                yield event_name, _parse_sse_data(data_lines)
-                data_lines = []
-                event_name = None
-            continue
-        if line.startswith("event:"):
-            event_name = line[len("event:"):].strip()
-        elif line.startswith("data:"):
-            data_lines.append(line[len("data:"):].strip())
-    if data_lines:
-        yield event_name, _parse_sse_data(data_lines)
-
-
-# ---------------------------------------------------------------------------
-# Shadow loop (N-4 / QG-03 / QG-04).
-# ---------------------------------------------------------------------------
-
-
-class _ShadowStreamer:
-    """Drives the outbound SSE stream with exploration tool-use shadowing.
-
-    For each internal upstream round it forwards text deltas and non-exploration
-    tool_use to the client immediately (QG-04), holds exploration tool_use up to
-    ``MAX_SHADOW_ROUNDS`` per request (QG-03), executes them locally, then
-    re-submits the ``tool_result`` blocks upstream and continues with the new
-    round. When no more exploration tool_use is held, the round's closing SSE
-    events are flushed and the stream completes.
-    """
-
-    def __init__(
-        self,
-        method: str,
-        url: str,
-        headers: Dict[str, str],
-        body: Dict[str, Any],
-        session_key: Optional[str],
-        context_dir: str = ".",
-        trace_id: str | None = None,
-    ) -> None:
-        self.method = method
-        self.url = url
-        self.headers = headers
-        self.body = body
-        self.session_key = session_key
-        self.context_dir = context_dir
-        self.trace_id = trace_id or str(uuid4())
-        # Insurance: if the streamer is ever constructed outside the request task
-        # that called logger.set_trace_id, stamp the trace id here so every
-        # source-level event of the shadow loop shares it (contextvars propagate
-        # into asyncio.to_thread worker threads and asyncio.gather child tasks).
-        logger.set_trace_id(self.trace_id)
-        self.round = 1
-        self.shadow_used = 0
-        self.client_index = 0
-        self._pending_held: List[Dict[str, Any]] = []
-        self._round_failed = False
-        self._start_ts = time.monotonic()
-
-    # -- public driver -------------------------------------------------
-
-    async def run(self) -> AsyncGenerator[bytes, None]:
-        """Yield SSE bytes to the client, looping internal shadow rounds."""
-        try:
-            while True:
-                messages = self.body.get("messages", [])
-                self._pending_held = []
-                async for chunk in self._stream_round(messages):
-                    yield chunk
-                held = self._pending_held
-                if not held:
-                    break
-                self.body = {
-                    **self.body,
-                    "messages": self._build_followup(messages, held),
-                }
-            logger.log(
-                SSE_STREAM_COMPLETE,
-                trace_id=self.trace_id,
-                duration_ms=self._elapsed_ms(),
-                # P-4: self.round is incremented at the END of each _stream_round,
-                # so a single-round request reads 2 — log the actual upstream
-                # call count.
-                rounds=self.round - 1,
-                shadow_used=self.shadow_used,
-                status="error" if self._round_failed else "ok",
-            )
-        except UpstreamError as exc:
-            payload = {
-                "type": "error",
-                "error": {"type": "api_error", "message": str(exc)},
-            }
-            yield self._format_event("error", payload)
-            logger.log(
-                SSE_STREAM_COMPLETE,
-                trace_id=self.trace_id,
-                status="error",
-                error=str(exc),
-            )
-            return
-
-    # -- per-round processing -------------------------------------------
-
-    async def _stream_round(self, messages: List[Dict[str, Any]]) -> AsyncGenerator[bytes, None]:
-        """Stream one upstream round. Sets ``self._pending_held`` on exit."""
-        try:
-            client, resp = await _request_upstream(
-                self.method, self.url, self.headers, {**self.body, "messages": messages}
-            )
-        except UpstreamError as exc:
-            self._round_failed = True
-            payload = {
-                "type": "error",
-                "error": {"type": "api_error", "message": str(exc)},
-            }
-            yield self._format_event("error", payload)
-            return
-
+        return
+    try:
         if resp.status_code >= 400:
-            self._round_failed = True
             body_text = (await resp.aread()).decode("utf-8", errors="replace")
-            await resp.aclose()
-            await client.aclose()
-            payload = {
+            yield "error", {
                 "type": "error",
                 "error": {
                     "type": "upstream_error",
-                    "message": f"upstream returned {resp.status_code}: {body_text[:200]}",
+                    "message": (
+                        f"upstream returned {resp.status_code}: {body_text[:200]}"
+                    ),
                 },
             }
-            yield self._format_event("error", payload)
             return
+        async for event_name, payload in _iter_sse_events(resp):
+            yield event_name, payload
+    except httpx.TransportError as exc:
+        yield "error", {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": f"stream interrupted: {exc}",
+            },
+        }
+    finally:
+        await resp.aclose()
+        await client.aclose()
 
-        held_indices: set[int] = set()
-        held_by_index: Dict[int, Dict[str, Any]] = {}
-        client_index_map: Dict[int, int] = {}
-        buffered_end: List[Tuple[Optional[str], Dict[str, Any]]] = []
-        round_had_held = False
 
-        try:
-            async for event_name, payload in _iter_sse_events(resp):
-                etype = payload.get("type", "")
+def _should_shadow(tool_name: str, shadow_used: int) -> bool:
+    """Shadow-loop decision callback: hold exploration tool_use up to the bound.
 
-                if etype == "message_start":
-                    if self.round == 1:
-                        yield self._format_event(event_name, payload)
-                    continue
+    Injected into :class:`router.shadow_loop.ShadowStreamer` so the loop stays
+    decoupled from tool_shadow's name registry and the shadow-round bound.
+    """
+    return tool_name in TOOL_NAMES and shadow_used < MAX_SHADOW_ROUNDS
 
-                if etype in ("message_delta", "message_stop"):
-                    buffered_end.append((event_name, payload))
-                    continue
-
-                if etype == "content_block_start":
-                    index = payload.get("index")
-                    if not isinstance(index, int):
-                        yield self._format_event(event_name, payload)
-                        continue
-                    cb = payload.get("content_block", {})
-                    is_tool_use = cb.get("type") == "tool_use"
-                    name = cb.get("name", "")
-                    if (
-                        isinstance(index, int)
-                        and is_tool_use
-                        and name in TOOL_NAMES
-                        and self.shadow_used < MAX_SHADOW_ROUNDS
-                    ):
-                        self.shadow_used += 1
-                        round_had_held = True
-                        held_indices.add(index)
-                        base_input = cb.get("input")
-                        held_by_index[index] = {
-                            "index": index,
-                            "id": cb.get("id"),
-                            "name": name,
-                            "input_parts": (
-                                [json.dumps(base_input)] if isinstance(base_input, dict) and base_input else []
-                            ),
-                        }
-                        logger.log(
-                            TOOL_SHADOW_INTERCEPT,
-                            trace_id=self.trace_id,
-                            tool_name=name,
-                            action_taken="hold",
-                        )
-                        continue
-                    new_index = self.client_index
-                    self.client_index += 1
-                    client_index_map[index] = new_index
-                    payload = dict(payload)
-                    payload["index"] = new_index
-                    yield self._format_event(event_name, payload)
-                    continue
-
-                if etype == "content_block_delta":
-                    index = payload.get("index")
-                    if not isinstance(index, int):
-                        yield self._format_event(event_name, payload)
-                        continue
-                    if index in held_indices:
-                        delta = payload.get("delta", {})
-                        partial = delta.get("partial_json", "") if isinstance(delta, dict) else ""
-                        if isinstance(partial, str):
-                            held_by_index[index]["input_parts"].append(partial)
-                        continue
-                    new_index = client_index_map.get(index)
-                    if new_index is None:
-                        continue
-                    payload = dict(payload)
-                    payload["index"] = new_index
-                    yield self._format_event(event_name, payload)
-                    continue
-
-                if etype == "content_block_stop":
-                    index = payload.get("index")
-                    if not isinstance(index, int):
-                        yield self._format_event(event_name, payload)
-                        continue
-                    if index in held_indices:
-                        continue
-                    new_index = client_index_map.get(index)
-                    if new_index is None:
-                        continue
-                    payload = dict(payload)
-                    payload["index"] = new_index
-                    yield self._format_event(event_name, payload)
-                    continue
-
-                if etype == "ping":
-                    yield self._format_event(event_name, payload)
-                    continue
-
-                if etype == "error":
-                    # Upstream sent an SSE error; forward and stop the round.
-                    self._round_failed = True
-                    yield self._format_event(event_name, payload)
-                    return
-
-                # Unknown event type: forward untouched.
-                yield self._format_event(event_name, payload)
-        except httpx.TransportError as exc:
-            # Mid-stream transport failure (connection reset, read error): emit
-            # a graceful SSE error instead of a truncated client stream (P-3
-            # review MAJOR). Marked failed so run() logs status="error".
-            self._round_failed = True
-            payload = {
-                "type": "error",
-                "error": {
-                    "type": "api_error",
-                    "message": f"stream interrupted: {exc}",
-                },
-            }
-            yield self._format_event("error", payload)
-            return
-        finally:
-            await resp.aclose()
-            await client.aclose()
-
-        self.round += 1
-
-        if held_indices:
-            self._pending_held = await self._execute_held(
-                [held_by_index[i] for i in sorted(held_indices)]
-            )
-            return
-
-        # No held blocks this round -> flush the closing SSE events.
-        for event_name, payload in buffered_end:
-            yield self._format_event(event_name, payload)
-
-    # -- helpers ---------------------------------------------------------
-
-    async def _execute_held(
-        self, held_blocks: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Execute each held exploration tool locally (parallel) and summarize.
-
-        Defensive (issue #1): ``content_block_start`` from upstream models
-        (doubao/glm/deepseek) always carries ``input={}`` and the real
-        arguments arrive only via ``partial_json`` deltas. When those deltas
-        are missing or truncated (empty input, or JSON that never parses), the
-        block is NOT executed -- instead we log the condition explicitly and
-        return an actionable ``tool_result`` so the model can re-issue with
-        explicit arguments instead of silently re-feeding a bare "no path
-        provided" error into a retry loop.
-        """
-
-        async def _exec(block: Dict[str, Any]) -> Dict[str, Any]:
-            tool_input = self._join_input(block["input_parts"])
-            if not tool_input:
-                logger.log(
-                    TOOL_SHADOW_INTERCEPT,
-                    trace_id=self.trace_id,
-                    tool_name=block["name"],
-                    action_taken="empty_input",
-                )
-                return {
-                    **block,
-                    "input": {},
-                    "content": (
-                        f"ERROR: tool {block['name']!r} received an empty input "
-                        f"(no arguments streamed). Re-issue the call with explicit "
-                        f"arguments (e.g. file_path/path/pattern)."
-                    ),
-                }
-            if "_partial_json" in tool_input:
-                logger.log(
-                    TOOL_SHADOW_INTERCEPT,
-                    trace_id=self.trace_id,
-                    tool_name=block["name"],
-                    action_taken="truncated_input",
-                )
-                return {
-                    **block,
-                    "input": {},
-                    "content": (
-                        f"ERROR: tool {block['name']!r} input was truncated "
-                        f"mid-stream (incomplete JSON). Re-issue the call with "
-                        f"explicit arguments."
-                    ),
-                }
-            raw = await execute_local_tool(block["name"], tool_input, self.context_dir)
-            summarized = await summarize_exploration(block["name"], raw)
-            return {**block, "input": tool_input, "content": summarized}
-
-        return await asyncio.gather(*[_exec(b) for b in held_blocks])
-
-    @staticmethod
-    def _join_input(parts: List[str]) -> Dict[str, Any]:
-        """Reassemble ``partial_json`` fragments into a tool input dict."""
-        raw = "".join(parts)
-        if not raw.strip():
-            return {}
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-        return {"_partial_json": raw}
-
-    def _build_followup(
-        self, messages: List[Dict[str, Any]], held: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Append the assistant tool_use + user tool_result turns."""
-        assistant_content: List[Dict[str, Any]] = []
-        user_results: List[Dict[str, Any]] = []
-        for block in held:
-            assistant_content.append(
-                {
-                    "type": "tool_use",
-                    "id": block["id"],
-                    "name": block["name"],
-                    "input": block.get("input", {}),
-                }
-            )
-            user_results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": block["id"],
-                    "content": block.get("content", ""),
-                }
-            )
-        followup = list(messages)
-        if assistant_content:
-            followup.append({"role": "assistant", "content": assistant_content})
-        followup.append({"role": "user", "content": user_results})
-        return followup
-
-    @staticmethod
-    def _format_event(event_name: Optional[str], payload: Dict[str, Any]) -> bytes:
-        etype = str(payload.get("type") or event_name or "message")
-        return f"event: {etype}\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
-
-    def _elapsed_ms(self) -> int:
-        return int((time.monotonic() - self._start_ts) * 1000)
 
 
 # ---------------------------------------------------------------------------
@@ -1382,16 +1020,80 @@ async def forward_streaming_request(
         logger.set_trace_id(trace_id)
 
     upstream_path = request.url.path
+    model = body.get("model")
+    if model == OLLAMA_MODEL:
+        # Model-level routing: OLLAMA_MODEL goes to the local Ollama
+        # Anthropic-compatible endpoint, fully isolated from the upstream path.
+        return await _forward_streaming_ollama(
+            request, body, trace_id=trace_id, context_dir=context_dir
+        )
     upstream_url = f"{UPSTREAM_BASE_URL}{upstream_path}"
     headers = _build_upstream_headers(request)
     session_key = request.headers.get("x-csmart-session")
+    logger.log(MODEL_ROUTED, model=model, target="upstream", upstream=upstream_url)
 
-    streamer = _ShadowStreamer(
+    streamer = ShadowStreamer(
+        sse_source=_sse_source,
+        should_shadow=_should_shadow,
         method="POST",
         url=upstream_url,
         headers=headers,
         body=body,
         session_key=session_key,
+        context_dir=context_dir,
+        trace_id=trace_id,
+    )
+
+    async def gen() -> AsyncGenerator[bytes, None]:
+        async for chunk in streamer.run():
+            yield chunk
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+async def _forward_streaming_ollama(
+    request: Request,
+    body: Dict[str, Any],
+    trace_id: str | None = None,
+    context_dir: str = ".",
+) -> Response:
+    """Forward a request for ``OLLAMA_MODEL`` to local Ollama, streaming SSE back.
+
+    No protocol translation: Ollama's native Anthropic-compatible endpoint
+    (``POST {OLLAMA_BASE_URL}/v1/messages``) accepts the Anthropic request body
+    as-is. Auth headers (``authorization``/``x-api-key``) are stripped — local
+    Ollama has no auth — while the other allowlisted headers (notably
+    ``content-type``) are kept. Reuses ``_sse_source`` + ``_upstream_timeout()``
+    and the same :class:`ShadowStreamer` as the upstream route, so retry/error
+    mapping and the shadow loop behave identically.
+    """
+    upstream_url = f"{OLLAMA_BASE_URL}/v1/messages"
+    headers = _build_upstream_headers(request)
+    headers.pop("authorization", None)
+    headers.pop("x-api-key", None)
+    logger.log(
+        MODEL_ROUTED,
+        model=body.get("model"),
+        target="ollama",
+        upstream=upstream_url,
+    )
+
+    streamer = ShadowStreamer(
+        sse_source=_sse_source,
+        should_shadow=_should_shadow,
+        method="POST",
+        url=upstream_url,
+        headers=headers,
+        body=body,
+        session_key=request.headers.get("x-csmart-session"),
         context_dir=context_dir,
         trace_id=trace_id,
     )

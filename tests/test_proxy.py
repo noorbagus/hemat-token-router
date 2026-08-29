@@ -42,7 +42,7 @@ def _hermetic(monkeypatch):
     monkeypatch.setattr(dispatcher, "_RATE_BUCKETS", type(dispatcher._RATE_BUCKETS)())
     monkeypatch.setattr(
         "router.ast_extractor.scan_project_codebase",
-        lambda root_dir, ignore_dirs: ["// mock.py\n- def mock()\n"],
+        lambda root_dir, ignore_dirs: (["// mock.py\n- def mock()\n"], 100),
     )
 
     def _route(skeleton, prompt):

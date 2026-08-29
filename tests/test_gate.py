@@ -9,19 +9,16 @@ import tempfile
 import pytest
 
 import router.gate as mod
-from router.gate import apply_gate, GateResult
+from router.gate import apply_gate
 from router.logger import StructuredLogger, GATE_APPLIED
 from router.ollama_scorer import RoutingResult
 
 
 def test_empty_routing_result():
-    """Test gate when routing returns no files."""
+    """Empty target_files raises ValueError instead of silently returning blocked."""
     result = RoutingResult(target_files=[], confidence=0.5, reasoning="No match")
-    gate_result = apply_gate(result, threshold=0.5, budget_tokens=1000)
-
-    assert gate_result.status == "blocked"
-    assert len(gate_result.selected_files) == 0
-    assert gate_result.dropped_count == 0
+    with pytest.raises(ValueError, match="target_files is empty"):
+        apply_gate(result, threshold=0.5, budget_tokens=1000)
 
 
 def test_all_below_threshold():
@@ -191,16 +188,10 @@ def test_gate_applied_event_fallback(capture_logger, tmp_path):
 
 
 def test_gate_applied_event_blocked_no_candidates(capture_logger, tmp_path):
-    """GATE_APPLIED emitted with status=blocked when routing yields no candidates."""
+    """Empty routing input raises ValueError, so no GATE_APPLIED event is emitted."""
     result = RoutingResult(target_files=[], confidence=0.5, reasoning="none")
-    gate_result = apply_gate(result, threshold=0.5, budget_tokens=1000)
+    with pytest.raises(ValueError, match="target_files is empty"):
+        apply_gate(result, threshold=0.5, budget_tokens=1000)
 
-    assert gate_result.status == "blocked"
     capture_logger.flush()
-
-    rec = _gate_applied_record(_read_records(tmp_path))
-    assert rec["status"] == "blocked"
-    assert rec["candidates"] == 0
-    assert rec["selected_count"] == 0
-    assert rec["selected_files"] == []
-    assert rec["dropped_count"] == 0
+    assert not list(tmp_path.glob("session_*.jsonl")) or not _read_records(tmp_path)

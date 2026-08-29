@@ -149,7 +149,7 @@ class A:
         os.mkdir(Path(tmpdir) / "__pycache__")
         (Path(tmpdir) / "__pycache__" / "ignored.pyc").write_text("binary")
 
-        result = scan_project_codebase(tmpdir, {"__pycache__", ".git"})
+        result, _ = scan_project_codebase(tmpdir, {"__pycache__", ".git"})
         assert len(result) == 1
         assert "test.py" in result[0]
         assert "class A" in result[0]
@@ -168,7 +168,7 @@ def test_scan_emits_ast_scanned(tmp_path: Path, capture_logger: StructuredLogger
     scan metrics (scanned count, files encountered, parse failures, duration)."""
     (tmp_path / "compute.py").write_text("def compute():\n    return 1\n")
 
-    result = scan_project_codebase(str(tmp_path), {"__pycache__"})
+    result, _ = scan_project_codebase(str(tmp_path), {"__pycache__"})
 
     assert result  # the .py file yields a skeleton
     capture_logger.flush()
@@ -191,7 +191,7 @@ def test_scan_counts_only_supported_extensions(
     (tmp_path / "a.py").write_text("def a():\n    return 1\n")
     (tmp_path / "b.txt").write_text("not supported")
 
-    result = scan_project_codebase(str(tmp_path), set())
+    result, _ = scan_project_codebase(str(tmp_path), set())
 
     assert len(result) == 1
     capture_logger.flush()
@@ -208,7 +208,7 @@ def test_scan_empty_py_yields_skeleton_not_parse_failure(
     parse_failures stays 0."""
     (tmp_path / "empty.py").write_text("")
 
-    result = scan_project_codebase(str(tmp_path), set())
+    result, _ = scan_project_codebase(str(tmp_path), set())
 
     assert len(result) == 1
     assert "empty.py" in result[0]
@@ -227,7 +227,7 @@ def test_scan_counts_parse_failure(
     is counted as a parse failure and yields no skeleton."""
     os.symlink(str(tmp_path / "does-not-exist.py"), tmp_path / "broken.py")
 
-    result = scan_project_codebase(str(tmp_path), set())
+    result, _ = scan_project_codebase(str(tmp_path), set())
 
     assert result == []
     capture_logger.flush()

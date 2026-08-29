@@ -501,8 +501,9 @@ def test_resolve_reasoning_effort():
     assert cp._resolve_reasoning_effort({"reasoning": {"effort": "max"}}) == "high"
     # thinking blocks
     assert cp._resolve_reasoning_effort({"thinking": {"type": "enabled"}}) == "medium"
-    assert cp._resolve_reasoning_effort({"thinking": {"type": "disabled"}}) == "off"
-    assert cp._resolve_reasoning_effort({"thinking": {"enabled": False}}) == "off"
+    # disabled thinking maps to None — upstream rejects the literal "off" string
+    assert cp._resolve_reasoning_effort({"thinking": {"type": "disabled"}}) is None
+    assert cp._resolve_reasoning_effort({"thinking": {"enabled": False}}) is None
     # unknown effort falls back to low
     assert cp._resolve_reasoning_effort({"reasoning": {"effort": "bogus"}}) == "low"
     # no signal + no env override -> None (provider default)
@@ -533,7 +534,7 @@ def test_responses_sse_transform_real_delta_string():
     result = _collect_sse(raw_events)
 
     event_types = [t for t, _ in result]
-    assert event_types == ["message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "message_stop"]
+    assert event_types == ["message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]
 
     # Collect all text fragments
     text = "".join(
@@ -596,6 +597,7 @@ def test_responses_sse_transform_tool_use():
         "content_block_delta",   # input_json (partial)
         "content_block_delta",   # input_json (partial)
         "content_block_stop",    # tool_use done
+        "message_delta",         # X-2: stop_reason + final usage
         "message_stop",
     ]
 
@@ -612,6 +614,120 @@ def test_responses_sse_transform_tool_use():
         if isinstance(d, dict) and d.get("type") == "content_block_delta"
     )
     assert json_frag == '{"command": "ls"}'
+
+
+def test_responses_sse_transform_tool_args_done_only():
+    """A provider that emits ONLY response.function_call_arguments.done (full
+    args string in {\"delta\": ...}) with no prior .delta events must still
+    deliver the tool_use arguments — not leave input as {}."""
+    raw_events: list[tuple[str | None, dict[str, Any]]] = [
+        ("response.created", {"type": "response.created"}),
+        (
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "id": "fc_456",
+                    "type": "function_call",
+                    "call_id": "call_xyz",
+                    "name": "Bash",
+                    "arguments": "",
+                    "status": "in_progress",
+                },
+            },
+        ),
+        (
+            "response.function_call_arguments.done",
+            {"type": "response.function_call_arguments.done", "delta": '{"command": "ls"}'},
+        ),
+        (
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "id": "fc_456",
+                    "type": "function_call",
+                    "call_id": "call_xyz",
+                    "name": "Bash",
+                    "arguments": '{"command": "ls"}',
+                    "status": "completed",
+                },
+            },
+        ),
+        ("response.completed", {"type": "response.completed"}),
+    ]
+    result = _collect_sse(raw_events)
+
+    # Concatenated partial_json must equal the full arguments JSON.
+    json_frag = "".join(
+        d["delta"]["partial_json"]
+        for _, d in result
+        if isinstance(d, dict) and d.get("type") == "content_block_delta"
+    )
+    assert json_frag == '{"command": "ls"}'
+
+    # A content_block_delta of type input_json_delta must have been emitted.
+    assert any(
+        isinstance(d, dict)
+        and d.get("type") == "content_block_delta"
+        and d["delta"].get("type") == "input_json_delta"
+        for _, d in result
+    )
+
+
+def test_responses_sse_transform_output_text_done():
+    """A provider that emits ONLY response.output_text.done (final full text)
+    with no .delta events must still deliver the text to the client."""
+    raw_events: list[tuple[str | None, dict[str, Any]]] = [
+        ("response.created", {"type": "response.created"}),
+        ("response.output_text.done", {"type": "response.output_text.done", "text": "hello world"}),
+        ("response.completed", {"type": "response.completed"}),
+    ]
+    result = _collect_sse(raw_events)
+
+    event_types = [t for t, _ in result]
+    assert "message_start" in event_types
+    assert "content_block_start" in event_types
+    assert "content_block_delta" in event_types
+    assert "content_block_stop" in event_types
+    assert "message_stop" in event_types
+
+    text = "".join(
+        d["delta"]["text"]
+        for _, d in result
+        if isinstance(d, dict) and d.get("type") == "content_block_delta"
+    )
+    assert text == "hello world"
+
+
+def test_responses_transform_tool_result_dict_to_json():
+    """A tool_result whose content is a dict must become valid JSON in the
+    Responses function_call_output.output field — NOT a Python repr."""
+    payload: dict[str, Any] = {
+        "model": "opencode-go/muse-spark-1.2-contributor",
+        "max_tokens": 100,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_abc",
+                        "content": {"kind": "json", "rows": [1, 2]},
+                    }
+                ],
+            },
+        ],
+    }
+    result = cp.transform_anthropic_to_openai_responses(payload)
+    fco = [i for i in result["input"] if i.get("type") == "function_call_output"]
+    assert len(fco) == 1
+    assert fco[0]["call_id"] == "call_abc"
+    # Must be parseable JSON that deep-equals the original dict.
+    parsed = json.loads(fco[0]["output"])
+    assert parsed == {"kind": "json", "rows": [1, 2]}
+    # Must NOT be a Python repr (single-quoted keys).
+    assert fco[0]["output"] != "{'kind': 'json', 'rows': [1, 2]}"
 
 
 def test_responses_transform_roundtrip_flattens_tool_calls():

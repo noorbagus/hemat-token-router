@@ -143,7 +143,7 @@ def test_main_cli_skips_path_traversal_selected_files(monkeypatch, tmp_path) -> 
     secret.write_text("SECRET=1")
 
     def fake_scan(root_dir, ignore_dirs):
-        return ["// ok.py\n- def ok()\n"]
+        return ["// ok.py\n- def ok()\n"], 100
 
     def fake_route(skeleton, prompt):
         return RoutingResult(

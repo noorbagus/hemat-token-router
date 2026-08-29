@@ -32,6 +32,7 @@ import router.dispatcher as dispatcher
 import router.gate as gate_mod
 import router.ollama_scorer as os_mod
 import router.routing_cache as rc_mod
+import router.shadow_loop as sl_mod
 import router.tool_shadow as ts_mod
 
 
@@ -215,7 +216,7 @@ def _hermetic(monkeypatch):
     monkeypatch.setattr(dispatcher, "_RATE_BUCKETS", type(dispatcher._RATE_BUCKETS)())
     monkeypatch.setattr(
         "router.ast_extractor.scan_project_codebase",
-        lambda root_dir, ignore_dirs: ["// mock.py\n- def mock()\n"],
+        lambda root_dir, ignore_dirs: (["// mock.py\n- def mock()\n"], 100),
     )
 
     def _route(skeleton, prompt):
@@ -293,6 +294,52 @@ def test_text_deltas_streamed_to_client(mock_upstream):
     assert "Hello from upstream" in resp.text
     assert '"type": "content_block_delta"' in resp.text
     assert len(calls) == 1
+
+
+def test_model_qwen_routed_to_ollama_strips_auth(mock_upstream):
+    """model == OLLAMA_MODEL routes to {OLLAMA_BASE_URL}/v1/messages, auth stripped."""
+    calls = mock_upstream([_sse_text("hi from qwen")])
+
+    resp = _run(_post_messages(
+        {
+            "model": "qwen2.5-coder:7b",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        headers={"authorization": "Bearer secret", "x-api-key": "secret2"},
+    ))
+
+    assert resp.status_code == 200
+    assert "hi from qwen" in resp.text
+    assert len(calls) == 1
+    req = calls[0]
+    assert str(req.url).startswith("http://127.0.0.1:11434/v1/messages")
+    assert "authorization" not in req.headers
+    assert "x-api-key" not in req.headers
+    # Anthropic body forwarded as-is (no protocol translation).
+    assert json.loads(req.content)["model"] == "qwen2.5-coder:7b"
+
+
+def test_model_other_routed_to_upstream_keeps_auth(mock_upstream):
+    """model != OLLAMA_MODEL keeps the existing upstream route + auth (unchanged)."""
+    calls = mock_upstream([_sse_text("hello")])
+
+    resp = _run(_post_messages(
+        {
+            "model": "deepseek-v4-flash",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        headers={"authorization": "Bearer secret"},
+    ))
+
+    assert resp.status_code == 200
+    assert "hello" in resp.text
+    assert len(calls) == 1
+    req = calls[0]
+    assert str(req.url).startswith("https://api.deepseek.com/anthropic/v1/messages")
+    assert req.headers["authorization"] == "Bearer secret"
+    assert json.loads(req.content)["model"] == "deepseek-v4-flash"
 
 
 def test_exploration_tool_use_intercepted_and_resubmitted(mock_upstream, tmp_path, monkeypatch):
@@ -927,7 +974,7 @@ def test_run_local_routing_passes_capped_skeleton(monkeypatch):
 
     monkeypatch.setattr(
         "router.ast_extractor.scan_project_codebase",
-        lambda root_dir, ignore_dirs: [big_skeleton],
+        lambda root_dir, ignore_dirs: ([big_skeleton], len(big_skeleton)),
     )
     monkeypatch.setattr("router.ollama_scorer.route_target_files", _route)
 
@@ -949,7 +996,7 @@ def test_routing_ttl_cache_reuses_across_burst(monkeypatch):
     monkeypatch.setattr("router.ollama_scorer.route_target_files", _counting_route)
     monkeypatch.setattr(
         "router.ast_extractor.scan_project_codebase",
-        lambda root_dir, ignore_dirs: ["// a.py\n- def a()\n"],
+        lambda root_dir, ignore_dirs: (["// a.py\n- def a()\n"], 100),
     )
 
     _run(dispatcher.run_local_routing("task one"))
@@ -971,7 +1018,7 @@ def test_routing_ttl_cache_prompt_differentiated(monkeypatch):
     monkeypatch.setattr("router.ollama_scorer.route_target_files", _counting_route)
     monkeypatch.setattr(
         "router.ast_extractor.scan_project_codebase",
-        lambda root_dir, ignore_dirs: ["// a.py\n- def a()\n"],
+        lambda root_dir, ignore_dirs: (["// a.py\n- def a()\n"], 100),
     )
 
     # Same context_dir (default "."), different prompts -> no stale hit.
@@ -1180,7 +1227,7 @@ def test_full_chain_event_sequence(mock_upstream, tmp_path, monkeypatch):
 
     # One shared capture logger across every module that emits source events.
     cap = StructuredLogger(log_dir=tmp_path)
-    for m in (dispatcher, ast_mod, os_mod, ts_mod, gate_mod, rc_mod):
+    for m in (dispatcher, ast_mod, os_mod, ts_mod, gate_mod, rc_mod, sl_mod):
         monkeypatch.setattr(m, "logger", cap)
 
     # Upstream: a GrepTool round (held + run locally) then a plain text round.

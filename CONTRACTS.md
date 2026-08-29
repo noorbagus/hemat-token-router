@@ -58,6 +58,7 @@ PASSTHROUGH = "PASSTHROUGH"
 UPSTREAM_HEALTH = "UPSTREAM_HEALTH"
 OLLAMA_HEALTH = "OLLAMA_HEALTH"
 UPSTREAM_RETRY = "UPSTREAM_RETRY"
+MODEL_ROUTED = "MODEL_ROUTED"
 ```
 
 **Event → emitter (1 record per keputusan, Wave 3):**
@@ -65,10 +66,11 @@ UPSTREAM_RETRY = "UPSTREAM_RETRY"
 | Event | Emitter | Fields kunci |
 |---|---|---|
 | `INBOUND_REQUEST` | `dispatcher.handle_messages_request` | path, prompt_len, session |
-| `AST_SCANNED` | `ast_extractor.scan_project_codebase` | root_dir, scanned_files_count, files_encountered, parse_failures, duration_ms |
+| `AST_SCANNED` | `ast_extractor.scan_project_codebase` | root_dir, scanned_files_count, files_encountered, parse_failures, full_codebase_bytes, skeleton_bytes, duration_ms |
 | `AST_CACHE_HIT` | `dispatcher._get_or_scan_ast` | context_dir, scanned_files_count, cache_size |
 | `ROUTING_CACHE_HIT/MISS/EXPIRED/PUT` | `routing_cache.LRU/TTL.get/.put` | cache(lru\|ttl), key, size, ttl_seconds, age_ms, evicted |
-| `OLLAMA_TRIAGE` | `ollama_scorer.route_target_files` (`source="ollama"`) / `_keyword_heuristic` (`source="heuristic"`) | model, source, confidence, selected_files, reasoning, duration_ms |
+| `OLLAMA_TRIAGE` | `ollama_scorer.route_target_files` (`source="ollama"`) / `_keyword_heuristic` (`source="heuristic"`) | model, source, confidence, selected_files, reasoning, prompt_eval_count, eval_count, duration_ms |
+| `TOKEN_SAVINGS` | `csmart.main_cli` / `dispatcher.run_local_routing` | full_codebase_bytes, injected_bytes, estimated_tokens_saved, status/gate_status |
 | `OLLAMA_FALLBACK` | `ollama_scorer._keyword_heuristic` | model, error(≤200), keywords_count, matched_files, confidence, duration_ms |
 | `GATE_APPLIED` | `gate.apply_gate` | status, candidates, selected_files, selected_count, selected_bytes, estimated_tokens, dropped_count, threshold, budget_tokens, confidence, reason |
 | `IMPORT_EXPANSION` | `dispatcher._expand_selected_with_imports` | base_dir, selected_count, appended_count, expanded_count, dropped_by_budget, budget_tokens, total_bytes |
@@ -83,6 +85,7 @@ UPSTREAM_RETRY = "UPSTREAM_RETRY"
 | `UPSTREAM_HEALTH` | `dispatcher.check_upstream_health` | ok, status_code, duration_ms |
 | `OLLAMA_HEALTH` | `dispatcher.check_ollama_health` | ok, model, error |
 | `UPSTREAM_RETRY` | `dispatcher._request_upstream` | attempt, max_retries, error |
+| `MODEL_ROUTED` | `dispatcher.forward_streaming_request` / `_forward_streaming_ollama` | model, target(ollama\|upstream), upstream |
 
 **Re-homing (Wave 3):** `AST_SCANNED`, `OLLAMA_TRIAGE`, `TOOL_LOCAL_EXEC` dipindah dari dispatcher ke source-nya. `OLLAMA_TRIAGE` kehilangan `session`/`cache_hit`/`selected_files` — info itu pindah ke `ROUTING_CACHE_*.key` + `GATE_APPLIED`.
 

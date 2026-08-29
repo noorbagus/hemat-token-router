@@ -23,6 +23,7 @@ class ExecutionMetrics(BaseModel):
     total_prepass_ms: int
     injected_files_count: int
     injected_bytes: int
+    full_codebase_bytes: Optional[int] = None  # baseline: total bytes of all scanned source files
 
 
 class GatewayConfig(BaseModel):
@@ -36,7 +37,7 @@ class GatewayConfig(BaseModel):
 
 class CsmartReport(BaseModel):
     """Full structured report for a csmart execution."""
-    schema_version: str = "1.0"
+    schema_version: str = "1.1"
     status: str  # "ok" | "gate_blocked" | "dispatch_error" | "env_error"
     timestamp: str  # ISO-8601 UTC
     task: str
@@ -130,12 +131,19 @@ def create_report(
     status: str,
     *,
     skeleton_bytes: int | None = None,
+    full_codebase_bytes: int | None = None,
 ) -> CsmartReport:
     """Create a complete CsmartReport with proper timestamp and metrics."""
     total_prepass = ast_scan_ms + local_routing_ms
 
-    # Estimate tokens saved vs the full skeleton context (tokens ≈ bytes / 4).
-    if skeleton_bytes is not None:
+    # Estimate tokens saved vs the full codebase baseline (tokens ≈ bytes / 4).
+    # Without csmart, DeepSeek would read the whole codebase; with it, only the
+    # injected context is sent. Fall back to the skeleton baseline when the
+    # full-codebase byte count is unavailable (e.g. proxy cache path or older
+    # callers).
+    if full_codebase_bytes is not None:
+        estimated_tokens_saved = max(0, (full_codebase_bytes - injected_bytes) // 4)
+    elif skeleton_bytes is not None:
         estimated_tokens_saved = max(0, (skeleton_bytes - injected_bytes) // 4)
     else:
         estimated_tokens_saved = None
@@ -150,6 +158,7 @@ def create_report(
             total_prepass_ms=total_prepass,
             injected_files_count=len(gate_result.selected_files),
             injected_bytes=injected_bytes,
+            full_codebase_bytes=full_codebase_bytes,
         ),
         routed_context=routing_result,
         gate_result=gate_result,

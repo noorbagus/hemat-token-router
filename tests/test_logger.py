@@ -18,6 +18,7 @@ from router.logger import (
     GATE_APPLIED,
     IMPORT_EXPANSION,
     INBOUND_REQUEST,
+    MODEL_ROUTED,
     OLLAMA_FALLBACK,
     OLLAMA_HEALTH,
     OLLAMA_TRIAGE,
@@ -77,12 +78,29 @@ def test_new_event_constants_exact():
     assert UPSTREAM_HEALTH == "UPSTREAM_HEALTH"
     assert OLLAMA_HEALTH == "OLLAMA_HEALTH"
     assert UPSTREAM_RETRY == "UPSTREAM_RETRY"
+    assert MODEL_ROUTED == "MODEL_ROUTED"
 
 
 def test_module_singleton():
     from router.logger import logger
 
     assert isinstance(logger, StructuredLogger)
+
+
+def test_model_routed_fields_roundtrip(logger, tmp_path):
+    logger.log(
+        MODEL_ROUTED,
+        model="qwen2.5-coder:7b",
+        target="ollama",
+        upstream="http://127.0.0.1:11434/v1/messages",
+    )
+    logger.flush()
+
+    (record,) = _read_records(tmp_path)
+    assert record["event"] == MODEL_ROUTED
+    assert record["model"] == "qwen2.5-coder:7b"
+    assert record["target"] == "ollama"
+    assert record["upstream"] == "http://127.0.0.1:11434/v1/messages"
 
 
 def test_jsonl_file_exists_and_parseable(logger, tmp_path):
