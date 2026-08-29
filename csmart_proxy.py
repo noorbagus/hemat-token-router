@@ -83,6 +83,22 @@ FLASH_MODEL = os.getenv("CSMART_FLASH_MODEL", "deepseek-chat")
 FLAGSHIP_MODEL = os.getenv("CSMART_FLAGSHIP_MODEL", "deepseek-reasoner")
 UPSTREAM_TIMEOUT = float(os.getenv("CSMART_UPSTREAM_TIMEOUT", "120"))
 MAX_TOKENS_FLOOR = int(os.getenv("CSMART_MIN_MAX_TOKENS", "4096"))
+MAX_TOKENS_CEIL = int(os.getenv("CSMART_MAX_MAX_TOKENS", "16384"))
+# Batas floor/cap per-model (match by substring, urut dari paling spesifik).
+# Cap = batas output model agar tidak terpotong; floor = minimal agar reasoning
+# tidak memakan seluruh budget. Nilai env override untuk tiap model bila diisi.
+_MODEL_TOKEN_LIMITS: List[Dict[str, Any]] = [
+    {
+        "keys": ["deepseek-v4", "deepseek-v4-flash"],
+        "floor": int(os.getenv("CSMART_MAX_TOKENS_FLOOR_DEEPSEEK", "8192")),
+        "ceil": int(os.getenv("CSMART_MAX_TOKENS_CEIL_DEEPSEEK", "32768")),
+    },
+    {
+        "keys": ["muse-spark", "muse-"],
+        "floor": int(os.getenv("CSMART_MAX_TOKENS_FLOOR_MUSE", "8192")),
+        "ceil": int(os.getenv("CSMART_MAX_TOKENS_CEIL_MUSE", "131072")),
+    },
+]
 MAX_ROUNDS = int(os.getenv("CSMART_MAX_SHADOW_ROUNDS", "5"))
 
 # Sanitizer (noise reduction)
@@ -143,7 +159,18 @@ OPENAI_RESPONSES_PATH = os.getenv(
 
 # System Prompt Steering for OpenAI-native models
 # Instructs model to follow Claude Code tool use format exactly
-SYSTEM_STEERING_PROMPT = """You are a coding assistant in a terminal chat. Follow EXACTLY the Claude Code tool use format:
+SYSTEM_STEERING_PROMPT = """You are a helpful coding assistant in a terminal chat. Follow EXACTLY the Claude Code tool use format.
+
+TOP PRIORITY — RESPOND TO WHAT WAS ACTUALLY ASKED:
+- If the user only greets you (halo, hi, hai, hello) or makes small talk, reply naturally in 1-2 short sentences. DO NOT analyze, DO NOT run commands, DO NOT create files, DO NOT propose plans.
+- NEVER invent or fabricate a task, document, plan, or file that the user did not ask for.
+- NEVER create files, folders, or run shell commands unless the user explicitly asks you to.
+- NEVER guess or assume the working directory; use the real current directory. Do not fabricate paths.
+- NEVER explore, list, or read files/directories unless the user explicitly asks. In particular, do NOT read graphify output (e.g. graphify-out/graph.json, graphify-out/*.md, graphify-merged/*), do NOT run graphify, and do NOT run `ls`, `find`, or `cat` just to "understand the codebase" — unless the user directly requests it.
+- Read the user's last message literally and do exactly that, nothing more.
+- Do NOT add unsolicited notes, caveats, or guesses about content the user did not send (e.g. do not claim the user attached an image, diagram, or task that is not in the message). If the message is only a greeting, reply with ONLY the greeting and nothing else.
+
+TOOL USE FORMAT (when you ARE asked to take action):
 - You MUST format tool calls as a JSON array in the tool_use block.
 - You MUST NOT add extra preamble, explanations, or thinking outside the content block.
 - You MUST use the provided tool definitions when the user asks to take action.
@@ -562,10 +589,37 @@ def sanitize_payload(body: Dict[str, Any]) -> None:
                 msg["content"] = _walk_content(msg.get("content"))
 
 
+def _model_token_limits(model_name: str) -> Tuple[int, int]:
+    """Resolve (floor, ceil) for a model name. Falls back to global default."""
+    lower = (model_name or "").lower()
+    for entry in _MODEL_TOKEN_LIMITS:
+        if any(k in lower for k in entry["keys"]):
+            return entry["floor"], entry["ceil"]
+    return MAX_TOKENS_FLOOR, MAX_TOKENS_CEIL
+
+
 def clamp_max_tokens(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Clamp client max_tokens to [floor, ceil]. Emits a structured JSON log
+    (TOKEN_CLAMP) tracking original, applied, floor, ceil, and action so
+    max-token and reasoning-budget behavior can be traced per model."""
     mt = body.get("max_tokens")
-    if isinstance(mt, int) and mt < MAX_TOKENS_FLOOR:
-        body["max_tokens"] = MAX_TOKENS_FLOOR
+    if not isinstance(mt, int):
+        _log("TOKEN_CLAMP", model=body.get("model", ""), requested=mt,
+             applied=mt, floor=None, ceil=None, action="skip_non_int")
+        return body
+    floor, ceil = _model_token_limits(body.get("model", ""))
+    if mt < floor:
+        applied = floor
+        action = "raised_to_floor"
+    elif mt > ceil:
+        applied = ceil
+        action = "lowered_to_ceil"
+    else:
+        applied = mt
+        action = "kept"
+    body["max_tokens"] = applied
+    _log("TOKEN_CLAMP", model=body.get("model", ""), requested=mt,
+         applied=applied, floor=floor, ceil=ceil, action=action)
     return body
 
 
@@ -769,26 +823,94 @@ def _convert_anthropic_tool_to_openai_responses(anthropic_tool: Dict[str, Any]) 
     }
 
 
-def _convert_anthropic_message_to_openai(anth_msg: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert Anthropic message format → OpenAI Chat Completions message."""
+def _convert_anthropic_message_to_openai(anth_msg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Convert Anthropic message → LIST of OpenAI Chat Completions messages.
+
+    Returns a list because a turn may expand to multiple OpenAI messages:
+    an assistant turn with text + tool_use becomes ONE assistant message holding
+    both ``content`` and ``tool_calls``, while each ``tool_result`` becomes its
+    own standalone ``role:"tool"`` message (OpenAI requires tool results as a
+    separate message, not merged into the user turn).
+    """
     role = anth_msg.get("role", "user")
     content = anth_msg.get("content", "")
 
     # Anthropic content is either str or list[blocks]
     if isinstance(content, str):
-        text_content = content
-    elif isinstance(content, list):
-        # Concatenate all text blocks (ignore non-text for now)
-        text_parts = []
-        for block in content:
-            if isinstance(block, dict):
-                if block.get("type") == "text" and "text" in block:
-                    text_parts.append(block["text"])
-        text_content = "".join(text_parts)
-    else:
-        text_content = str(content)
+        return [{"role": role, "content": content}]
 
-    return {"role": role, "content": text_content}
+    if not isinstance(content, list):
+        return [{"role": role, "content": str(content)}]
+
+    messages: List[Dict[str, Any]] = []
+    text_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    tool_calls: List[Dict[str, Any]] = []
+
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            txt = block.get("text", "")
+            if txt:
+                text_parts.append(txt)
+        elif btype == "thinking":
+            # K2b: preserve chain-of-thought from history. DeepSeek chat path
+            # carries CoT via reasoning_content on the assistant message (not a
+            # separate field); OpenAI modern models use thinking_blocks. We emit
+            # reasoning_content so the round-trip does not lose the thinking.
+            txt = block.get("thinking", "")
+            if txt:
+                reasoning_parts.append(txt)
+        elif btype == "tool_use":
+            # OpenAI embeds tool calls into the assistant message itself
+            tool_calls.append({
+                "id": block.get("id") or f"call_{len(tool_calls)}",
+                "type": "function",
+                "function": {
+                    "name": block.get("name", ""),
+                    "arguments": json.dumps(block.get("input", {}), sort_keys=True),
+                },
+            })
+        elif btype == "tool_result":
+            # tool_result is its own role:"tool" message in OpenAI chat format
+            tool_use_id = block.get("tool_use_id", "")
+            raw = block.get("content", "")
+            if isinstance(raw, list):
+                raw = "".join(
+                    p.get("text", "") for p in raw if isinstance(p, dict)
+                )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_use_id,
+                "content": str(raw),
+            })
+
+    # Emit the role message (assistant may carry both text and tool_calls).
+    # System messages that appear mid-conversation are kept as-is; OpenAI
+    # accepts a system message anywhere in the array. A user turn containing
+    # ONLY tool_result blocks produces just role:"tool" messages and no empty
+    # user stub (a bare {"role":"user","content":""} corrupts the sequence).
+    if role == "system":
+        return [{"role": "system", "content": "".join(text_parts)}]
+
+    if tool_calls or text_parts:
+        msg: Dict[str, Any] = {"role": role, "content": "".join(text_parts)}
+        if reasoning_parts and role == "assistant":
+            msg["reasoning_content"] = "\n".join(reasoning_parts)
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        messages.insert(0, msg)
+    elif reasoning_parts and role == "assistant":
+        # Assistant turn with ONLY a thinking block — still preserve the CoT.
+        messages.insert(0, {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "\n".join(reasoning_parts),
+        })
+
+    return messages
 
 
 def transform_anthropic_to_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -806,7 +928,7 @@ def transform_anthropic_to_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any
     # Add conversation messages
     for anth_msg in payload.get("messages", []):
         if isinstance(anth_msg, dict):
-            messages.append(_convert_anthropic_message_to_openai(anth_msg))
+            messages.extend(_convert_anthropic_message_to_openai(anth_msg))
 
     # Build OpenAI payload
     openai_payload: Dict[str, Any] = {
@@ -822,6 +944,15 @@ def transform_anthropic_to_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any
         openai_payload["temperature"] = payload["temperature"]
     if "top_p" in payload:
         openai_payload["top_p"] = payload["top_p"]
+
+    # Cap reasoning/chain-of-thought on the chat path (deepseek). Reasoning-model
+    # CoT can burn tens of thousands of tokens on a trivial prompt (observed: 2.8k
+    # thinking tokens + hallucinated tangents like "helm" for a bare greeting).
+    # reasoning_effort is honored by the upstream; effort "low" trims CoT length and
+    # wandering. Toggle via CSMART_REASONING_EFFORT (default low; "" disables).
+    _effort = os.getenv("CSMART_REASONING_EFFORT", "low").strip()
+    if _effort:
+        openai_payload["reasoning_effort"] = _effort
 
     # Convert tools if present
     anthropic_tools = payload.get("tools", [])
@@ -855,6 +986,7 @@ def _convert_anthropic_message_to_openai_responses(
     # Block format: [{"type":"text","text":...}] or tool_use/tool_result
     items: List[Dict[str, Any]] = []
     text_parts: List[str] = []
+    reasoning_parts: List[str] = []
 
     for block in content:
         if not isinstance(block, dict):
@@ -864,6 +996,13 @@ def _convert_anthropic_message_to_openai_responses(
             txt = block.get("text", "")
             if txt:
                 text_parts.append(txt)
+        elif btype == "thinking" and role == "assistant":
+            # K2b: preserve chain-of-thought from history as a Responses API
+            # "reasoning" input item (summary list). Keeps prompt cache + CoT
+            # intact across turns.
+            txt = block.get("thinking", "")
+            if txt:
+                reasoning_parts.append(txt)
         elif btype == "tool_use":
             items.append({
                 "type": "function_call",
@@ -903,7 +1042,9 @@ def _convert_anthropic_message_to_openai_responses(
             })
 
     # Emit text FIRST so item order mirrors the Anthropic content order
-    # (text block precedes tool blocks in the original turn).
+    # (text block precedes tool blocks in the original turn). K2b: assistant
+    # thinking is emitted as a "reasoning" item at the very front (thinking
+    # precedes text/tool blocks in an Anthropic assistant turn).
     if text_parts:
         text = "\n".join(text_parts)
         if role == "assistant":
@@ -914,6 +1055,12 @@ def _convert_anthropic_message_to_openai_responses(
             })
         else:
             items.insert(0, {"type": "message", "role": role, "content": text})
+    if reasoning_parts and role == "assistant":
+        reasoning_items = [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": t}]}
+            for t in reasoning_parts
+        ]
+        items[0:0] = reasoning_items
 
     # Preserve the original turn even when both text and tools are empty.
     if not items:
@@ -1013,19 +1160,75 @@ async def transform_openai_sse_to_anthropic(
     """
     # Track if we've sent message_start yet
     sent_message_start = False
-    # Accumulate tool call JSON for streaming
-    tool_call_index = 0
+    # Track whether the upstream stream emitted a terminal event (message_stop
+    # via [DONE] or finish_reason). If the upstream dies without one (connection
+    # drop / timeout / provider forgot the marker), we fall back to an explicit
+    # incomplete-stream error so the client is never left hanging.
+    saw_terminal_event = False
     events_processed = 0
     text_emitted = 0
+    # Reasoning (deepseek delta.reasoning_content) -> Anthropic thinking block.
+    # Thinking occupies index 0; the visible answer shifts to index 1.
+    reasoning_open = False
+    text_index = 0
+    text_started = False
+    emit_reasoning = os.getenv("CSMART_EMIT_REASONING", "1") == "1"
+    # Streaming tool_use blocks: Anthropic requires each block to be opened with
+    # content_block_start (id+name), streamed via input_json_delta, then closed
+    # with content_block_stop. Map OpenAI tool index -> Anthropic block index.
+    openai_tool_index_to_block = {}  # openai delta index -> anthropic block index
+    open_tool_blocks = []            # anthropic block indices currently open (in order)
+    # OpenAI chat usage.prompt_tokens_details.cached_tokens -> cache_read_input_tokens.
+    # Populated from the final usage chunk when present; only emitted when > 0.
+    cache_read_tokens = 0
+
+    def _stop_reason(fr: Any) -> str:
+        # Map OpenAI finish_reason -> Anthropic stop_reason.
+        return "max_tokens" if fr == "length" else ("tool_use" if fr == "tool_calls" else "end_turn")
+
+    def _msg_delta(stop: str) -> Dict[str, Any]:
+        usage = {"input_tokens": 0, "output_tokens": text_emitted}
+        # Emit cache_read_input_tokens only when a real value was captured (> 0).
+        if cache_read_tokens > 0:
+            usage["cache_read_input_tokens"] = cache_read_tokens
+        return {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop, "stop_sequence": None},
+            "usage": usage,
+        }
+
+    def _msg_stop_usage() -> Dict[str, Any]:
+        usage = {"input_tokens": 0, "output_tokens": text_emitted}
+        if cache_read_tokens > 0:
+            usage["cache_read_input_tokens"] = cache_read_tokens
+        return usage
 
     _log("OPENAI_SSE_TRANSFORM_START", status="started")
 
     async for _, openai_event in sse_events:
         events_processed += 1
+        # Capture prompt caching usage from the final chunk (OpenAI sends usage
+        # non-null on the last chunk). prompt_tokens_details.cached_tokens -> cache_read.
+        oai_usage = openai_event.get("usage")
+        if isinstance(oai_usage, dict):
+            ptd = (oai_usage.get("prompt_tokens_details") or {})
+            if isinstance(ptd, dict):
+                ct = ptd.get("cached_tokens")
+                if isinstance(ct, (int, float)) and ct > 0:
+                    cache_read_tokens = int(ct)
         # OpenAI sends [DONE] at end of stream (marked as sentinel dict)
         if openai_event.get("__openai_done"):
+            if reasoning_open:
+                yield "content_block_stop", {"type": "content_block_stop", "index": 0}
+            if text_started:
+                yield "content_block_stop", {"type": "content_block_stop", "index": text_index}
+            for block_idx in open_tool_blocks:
+                yield "content_block_stop", {"type": "content_block_stop", "index": block_idx}
+            open_tool_blocks.clear()
             _log("OPENAI_SSE_TRANSFORM_DONE", events_processed=events_processed, text_emitted=text_emitted)
-            yield "message_stop", {"type": "message_stop", "usage": {"input_tokens": 0, "output_tokens": text_emitted}}
+            yield "message_delta", _msg_delta("end_turn")
+            yield "message_stop", {"type": "message_stop", "usage": _msg_stop_usage()}
+            saw_terminal_event = True
             break
 
         choices = openai_event.get("choices", [])
@@ -1042,46 +1245,126 @@ async def transform_openai_sse_to_anthropic(
             yield "message_start", {
                 "type": "message_start",
                 "message": {
+                    "id": f"msg_{uuid.uuid4().hex[:24]}",
+                    "type": "message",
                     "role": "assistant",
+                    "model": _active_model,
                     "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
                 },
             }
             sent_message_start = True
 
+        # Handle reasoning_content (deepseek chain-of-thought) -> thinking block
+        reasoning = delta.get("reasoning_content")
+        if emit_reasoning and reasoning and not reasoning_open:
+            # First reasoning chunk opens a thinking block at index 0.
+            # LiteLLM emits signature:"" for non-signable providers (deepseek).
+            yield "content_block_start", {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            }
+            reasoning_open = True
+            text_index = 1
+        if reasoning_open and reasoning:
+            yield "content_block_delta", {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": reasoning},
+            }
+
         # Handle text content delta
         if "content" in delta and delta["content"] is not None:
             text = delta["content"]
+            if reasoning_open:
+                # Thinking block finished; visible answer lives at index 1.
+                yield "content_block_stop", {"type": "content_block_stop", "index": 0}
+                reasoning_open = False
             if text:
+                if not text_started:
+                    # Each block must be opened with content_block_start before deltas.
+                    yield "content_block_start", {
+                        "type": "content_block_start",
+                        "index": text_index,
+                        "content_block": {"type": "text", "text": ""},
+                    }
+                    text_started = True
                 text_emitted += len(text)
                 yield "content_block_delta", {
                     "type": "content_block_delta",
-                    "index": 0,
+                    "index": text_index,
                     "delta": {"type": "text_delta", "text": text},
                 }
 
         # Handle tool call delta (streaming tool calls)
         if "tool_calls" in delta and delta["tool_calls"] is not None:
+            if reasoning_open:
+                yield "content_block_stop", {"type": "content_block_stop", "index": 0}
+                reasoning_open = False
             for tool_call_delta in delta["tool_calls"]:
-                # OpenAI streams tool_calls[].function.arguments incrementally
-                if "function" in tool_call_delta and "arguments" in tool_call_delta["function"]:
-                    args = tool_call_delta["function"]["arguments"]
-                    if args:
-                        yield "content_block_delta", {
-                            "type": "content_block_delta",
-                            "index": 1 + tool_call_index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": args,
-                            },
-                        }
-                if "name" in tool_call_delta:
-                    # New tool call starts here — increment index
-                    tool_call_index += 1
+                oai_index = tool_call_delta.get("index", 0)
+                fn = tool_call_delta.get("function", {})
+                name = fn.get("name")
+                args = fn.get("arguments", "")
+                tool_id = tool_call_delta.get("id")
+
+                # First chunk of a tool call carries id + name -> open the block.
+                if oai_index not in openai_tool_index_to_block:
+                    block_idx = text_index + 1 + len(open_tool_blocks)  # continuous indexing
+                    openai_tool_index_to_block[oai_index] = block_idx
+                    open_tool_blocks.append(block_idx)
+                    yield "content_block_start", {
+                        "type": "content_block_start",
+                        "index": block_idx,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tool_id or "",
+                            "name": name or "",
+                            "input": {},
+                        },
+                    }
+                block_idx = openai_tool_index_to_block[oai_index]
+
+                # Arguments stream in subsequent chunks -> emit deltas.
+                if args:
+                    yield "content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": block_idx,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": args,
+                        },
+                    }
 
         # End of stream
         if finish_reason is not None:
-            yield "message_stop", {"type": "message_stop", "usage": {"input_tokens": 0, "output_tokens": text_emitted}}
+            if reasoning_open:
+                yield "content_block_stop", {"type": "content_block_stop", "index": 0}
+            if text_started:
+                yield "content_block_stop", {"type": "content_block_stop", "index": text_index}
+            for block_idx in open_tool_blocks:
+                yield "content_block_stop", {"type": "content_block_stop", "index": block_idx}
+            open_tool_blocks.clear()
+            yield "message_delta", _msg_delta(_stop_reason(finish_reason))
+            yield "message_stop", {"type": "message_stop", "usage": _msg_stop_usage()}
+            saw_terminal_event = True
             break
+
+    # Upstream ended without a terminal event (connection drop / timeout).
+    # Never leave the client hanging: emit a spec-compliant incomplete error.
+    if not saw_terminal_event:
+        _log("OPENAI_SSE_TRANSFORM_INCOMPLETE", events_processed=events_processed, text_emitted=text_emitted)
+        yield "error", {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": ("csmart: provider stream ended before message_stop; "
+                            "response incomplete, content may be truncated"),
+            },
+        }
 
 
 async def transform_openai_responses_sse_to_anthropic(
@@ -1115,6 +1398,15 @@ async def transform_openai_responses_sse_to_anthropic(
     tool_index = 0  # running index for tool_use content blocks
     tool_args_streamed = False  # whether partial args were streamed for current tool
     counts: Dict[str, int] = {}  # per upstream event type, for observability
+    # K2b: Responses API reasoning (chain-of-thought) -> Anthropic thinking block.
+    # Thinking lives at a high index (1000) to avoid colliding with text (0) and
+    # tool blocks (1..N); it is opened on the first reasoning delta and closed on
+    # .done / text / tool appearance.
+    thinking_block_open = False
+    thinking_index = 1000
+    # K3: Responses usage.input_tokens_details.cached_tokens -> cache_read_input_tokens.
+    # Captured on response.completed; only emitted when > 0.
+    cache_read_tokens = 0
 
     def _ms_payload() -> Dict[str, Any]:
         """Full Anthropic message_start payload with id/model/usage."""
@@ -1134,13 +1426,16 @@ async def transform_openai_responses_sse_to_anthropic(
 
     def _md_payload() -> Dict[str, Any]:
         """Anthropic message_delta payload (stop_reason + final usage)."""
+        usage = {
+            "output_tokens": output_tokens,
+            "input_tokens": input_tokens,
+        }
+        if cache_read_tokens > 0:
+            usage["cache_read_input_tokens"] = cache_read_tokens
         return {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {
-                "output_tokens": output_tokens,
-                "input_tokens": input_tokens,
-            },
+            "usage": usage,
         }
 
     _log("OPENAI_RESPONSES_SSE_TRANSFORM", status="started")
@@ -1187,6 +1482,9 @@ async def transform_openai_responses_sse_to_anthropic(
             continue
 
         if event_type == "response.completed":
+            if thinking_block_open:
+                yield "content_block_stop", {"type": "content_block_stop", "index": thinking_index}
+                thinking_block_open = False
             if text_block_started:
                 yield "content_block_stop", {"type": "content_block_stop", "index": 0}
             resp_info = openai_event.get("response", {}) or {}
@@ -1198,6 +1496,12 @@ async def transform_openai_responses_sse_to_anthropic(
                 if isinstance(usage, dict):
                     input_tokens = int(usage.get("input_tokens", 0) or 0)
                     output_tokens = int(usage.get("output_tokens", 0) or 0)
+                    # K3: Responses usage.input_tokens_details.cached_tokens -> cache_read
+                    itd = usage.get("input_tokens_details") or {}
+                    if isinstance(itd, dict):
+                        ct = itd.get("cached_tokens")
+                        if isinstance(ct, (int, float)) and ct > 0:
+                            cache_read_tokens = int(ct)
                 # Determine stop_reason: tool_use if last item is function_call;
                 # otherwise map incomplete_details.reason to Anthropic stop_reason.
                 output_items = resp_info.get("output", []) or []
@@ -1226,8 +1530,10 @@ async def transform_openai_responses_sse_to_anthropic(
                 break  # error is terminal — do not emit completion events after it
             # X-2 fix: emit message_delta (stop_reason + final usage) BEFORE message_stop
             yield "message_delta", _md_payload()
-            yield "message_stop", {"type": "message_stop",
-                                    "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}}
+            _stop_usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+            if cache_read_tokens > 0:
+                _stop_usage["cache_read_input_tokens"] = cache_read_tokens
+            yield "message_stop", {"type": "message_stop", "usage": _stop_usage}
             _log("OPENAI_RESPONSES_SSE_TRANSFORM", status="completed", text_emitted=text_emitted,
                  upstream_status=status, events=counts, stop_reason=stop_reason,
                  input_tokens=input_tokens, output_tokens=output_tokens)
@@ -1238,6 +1544,9 @@ async def transform_openai_responses_sse_to_anthropic(
             if not sent_message_start:
                 yield "message_start", _ms_payload()
                 sent_message_start = True
+            if thinking_block_open:
+                yield "content_block_stop", {"type": "content_block_stop", "index": thinking_index}
+                thinking_block_open = False
             if not text_block_started:
                 yield "content_block_start", {
                     "type": "content_block_start",
@@ -1274,6 +1583,9 @@ async def transform_openai_responses_sse_to_anthropic(
                     if not sent_message_start:
                         yield "message_start", _ms_payload()
                         sent_message_start = True
+                    if thinking_block_open:
+                        yield "content_block_stop", {"type": "content_block_stop", "index": thinking_index}
+                        thinking_block_open = False
                     if not text_block_started:
                         yield "content_block_start", {
                             "type": "content_block_start",
@@ -1293,6 +1605,9 @@ async def transform_openai_responses_sse_to_anthropic(
         if event_type == "response.output_item.added":
             item = openai_event.get("item", {})
             if item.get("type") == "function_call":
+                if thinking_block_open:
+                    yield "content_block_stop", {"type": "content_block_stop", "index": thinking_index}
+                    thinking_block_open = False
                 tool_index += 1
                 tool_args_streamed = False
                 yield "content_block_start", {
@@ -1372,6 +1687,37 @@ async def transform_openai_responses_sse_to_anthropic(
                                     "index": 0,
                                     "delta": {"type": "text_delta", "text": txt},
                                 }
+            continue
+
+        # ---- reasoning / thinking stream (Responses API) ------------------
+        # response.reasoning_summary_text.delta / response.reasoning_text.delta
+        # carry chain-of-thought fragments -> Anthropic thinking block at the
+        # anti-collision index. Closed on .done, or when text/tool appears.
+        if event_type in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+            if not sent_message_start:
+                yield "message_start", _ms_payload()
+                sent_message_start = True
+            if not thinking_block_open:
+                yield "content_block_start", {
+                    "type": "content_block_start",
+                    "index": thinking_index,
+                    "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                }
+                thinking_block_open = True
+            delta = openai_event.get("delta", "")
+            text = delta.get("text", "") if isinstance(delta, dict) else delta
+            if text:
+                yield "content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": thinking_index,
+                    "delta": {"type": "thinking_delta", "thinking": text},
+                }
+            continue
+
+        if event_type in ("response.reasoning_summary_text.done", "response.reasoning_text.done"):
+            if thinking_block_open:
+                yield "content_block_stop", {"type": "content_block_stop", "index": thinking_index}
+                thinking_block_open = False
             continue
 
         # ---- everything else (ping, response.in_progress, content_part.*) skipped
@@ -1497,6 +1843,15 @@ def transform_openai_responses_to_anthropic_json(
                     txt = part.get("text", "")
                     if txt:
                         content.append({"type": "text", "text": txt})
+        elif itype == "reasoning":
+            # Responses API: reasoning summary is a list of parts, each with "text".
+            for part in (item.get("summary") or []):
+                if isinstance(part, dict) and part.get("text"):
+                    content.append({
+                        "type": "thinking",
+                        "thinking": part.get("text"),
+                        "signature": None,
+                    })
         elif itype == "function_call":
             content.append({
                 "type": "tool_use",
@@ -1506,11 +1861,17 @@ def transform_openai_responses_to_anthropic_json(
             })
             stop_reason = "tool_use"
 
-    usage = payload.get("usage", {})
+    usage = payload.get("usage", {}) or {}
     anthropic_usage = {
         "input_tokens": int(usage.get("input_tokens", 0)),
         "output_tokens": int(usage.get("output_tokens", 0)),
     }
+    # K3: OpenAI usage.input_tokens_details.cached_tokens -> cache_read_input_tokens
+    itd = usage.get("input_tokens_details") or {}
+    if isinstance(itd, dict):
+        ct = itd.get("cached_tokens")
+        if ct:
+            anthropic_usage["cache_read_input_tokens"] = int(ct)
     return {
         "id": f"msg_{payload.get('id', 'resp')[:8]}",
         "type": "message",
@@ -1531,6 +1892,10 @@ def transform_openai_chat_to_anthropic_json(
     stop_reason = "end_turn"
     choice = (payload.get("choices") or [{}])[0]
     msg = choice.get("message", {}) or {}
+    # Thinking block must precede text in Anthropic content
+    rc = msg.get("reasoning_content")
+    if isinstance(rc, str) and rc.strip():
+        content.append({"type": "thinking", "thinking": rc, "signature": None})
     if msg.get("content"):
         content.append({"type": "text", "text": msg["content"]})
     for tc in msg.get("tool_calls", []) or []:
@@ -1543,6 +1908,16 @@ def transform_openai_chat_to_anthropic_json(
         })
         stop_reason = "tool_use"
     usage = payload.get("usage", {}) or {}
+    anthropic_usage = {
+        "input_tokens": int(usage.get("prompt_tokens", 0)),
+        "output_tokens": int(usage.get("completion_tokens", 0)),
+    }
+    # K3: OpenAI usage.prompt_tokens_details.cached_tokens -> cache_read_input_tokens
+    ptd = usage.get("prompt_tokens_details") or {}
+    if isinstance(ptd, dict):
+        ct = ptd.get("cached_tokens")
+        if ct:
+            anthropic_usage["cache_read_input_tokens"] = int(ct)
     return {
         "id": f"msg_{payload.get('id', 'chat')[:8]}",
         "type": "message",
@@ -1551,10 +1926,7 @@ def transform_openai_chat_to_anthropic_json(
         "model": model or payload.get("model", ""),
         "stop_reason": stop_reason,
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": int(usage.get("prompt_tokens", 0)),
-            "output_tokens": int(usage.get("completion_tokens", 0)),
-        },
+        "usage": anthropic_usage,
     }
 
 
@@ -1927,6 +2299,7 @@ app = FastAPI(title="csmart Local Context Optimizer", lifespan=lifespan)
 def _upstream_headers(request: Request) -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {UPSTREAM_API_KEY}",
+        "x-api-key": UPSTREAM_API_KEY,  # Anthropic /v1/messages requires x-api-key, not Bearer
         "Content-Type": "application/json",
         "anthropic-version": request.headers.get("anthropic-version", "2023-06-01"),
     }
@@ -1978,24 +2351,27 @@ async def handle_messages(request: Request) -> StreamingResponse | JSONResponse:
     # Inject before 3-region alignment so steering is part of the immutable prefix
     # -------------------------------------------------------------------------
     if is_openai:
-        # Inject steering prompt into system (based on original detection)
+        # Inject steering prompt into system (based on original detection).
+        # PREPEND (first block) so the model reads it before the huge Claude Code
+        # agent prompt — appended steering was drowned and the model fabricated
+        # tasks on a bare greeting. First position = highest emphasis.
         steering_block = {"type": "text", "text": SYSTEM_STEERING_PROMPT}
         current_system = body.get("system", "")
         if isinstance(current_system, str):
-            # Convert string to list format and append
+            # Convert string to list format and prepend
             if current_system.strip():
                 body["system"] = [
-                    {"type": "text", "text": current_system},
                     steering_block,
+                    {"type": "text", "text": current_system},
                 ]
             else:
                 body["system"] = [steering_block]
         elif isinstance(current_system, list):
-            # Already list format, append
-            body["system"] = current_system + [steering_block]
+            # Already list format, prepend
+            body["system"] = [steering_block] + current_system
         else:
-            # Fallback: convert to string and append
-            body["system"] = f"{_extract_system_text(current_system)}\n\n{SYSTEM_STEERING_PROMPT}"
+            # Fallback: convert to string and prepend
+            body["system"] = f"{SYSTEM_STEERING_PROMPT}\n\n{_extract_system_text(current_system)}"
 
     # -------------------------------------------------------------------------
     # 3-region prefix alignment (includes steering now for cache stability)

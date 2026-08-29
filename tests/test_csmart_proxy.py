@@ -371,12 +371,16 @@ def test_secret_restored_to_client(mock_upstream):
 
 
 def test_client_auth_header_not_forwarded(mock_upstream):
-    """authorization/x-api-key client tidak pernah diteruskan ke upstream."""
+    """authorization/x-api-key client tidak pernah diteruskan ke upstream.
+
+    K7: upstream Anthropic /v1/messages butuh x-api-key — proxy kirim key
+    upstream sendiri (test-key-abcdef123456), BUKAN key client (client-x-api-456).
+    """
     calls = mock_upstream([_simple_upstream("ok")])
     _post(headers={"authorization": "Bearer client-real-key-123", "x-api-key": "client-x-api-456"})
     req_headers = dict(calls[0].headers)
     assert req_headers.get("authorization") == "Bearer test-key-abcdef123456"  # key upstream, bukan client
-    assert req_headers.get("x-api-key") is None
+    assert req_headers.get("x-api-key") == "test-key-abcdef123456"  # K7: key upstream, bukan client
 
 
 def test_max_tokens_clamped_to_floor(mock_upstream):
