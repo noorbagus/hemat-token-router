@@ -1,0 +1,59 @@
+{
+  "permissions": {
+    "defaultMode": "default",
+    "deny": [
+      "Read(~/.ssh/**)",
+      "Edit(~/.ssh/**)",
+      "Write(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Edit(~/.aws/**)",
+      "Write(~/.aws/**)",
+      "Read(~/.config/gcloud/**)",
+      "Edit(~/.config/gcloud/**)",
+      "Write(~/.config/gcloud/**)",
+      "Read(~/.kube/**)",
+      "Edit(~/.kube/**)",
+      "Write(~/.kube/**)",
+      "Read(~/.netrc)",
+      "Read(~/.git-credentials)",
+      "Read(~/.npmrc)",
+      "Read(~/.pypirc)",
+      "Read(~/.docker/config.json)",
+      "Read(~/.zsh_history)",
+      "Read(~/.bash_history)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.gnupg/**)",
+      "Read(.git/**)",
+      "Edit(.git/**)",
+      "Write(.git/**)",
+      "Read(/Volumes/Xugab/LAB/PrivateLink/**)",
+      "Read(/secrets/.env)"
+    ],
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(git diff:*)"
+    ]
+  },
+  "sandbox": {
+    "mode": "allowSome",
+    "network": {
+      "mode": "allowSome",
+      "allowedDomains": [
+        "api.deepseek.com"
+      ]
+    },
+    "filesystem": {
+      "readRoots": ["."],
+      "writeRoots": ["."]
+    },
+    "credentials": {
+      "mask": [
+        "API_KEY",
+        "UPSTREAM_BASE_URL",
+        "UPSTREAM_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "GITHUB_TOKEN"
+      ]
+    }
+  }
+}
