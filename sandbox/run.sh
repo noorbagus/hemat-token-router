@@ -33,7 +33,9 @@ export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-http://127.0.0.1:8080}"
 export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-dummy}"
 export CLAUDE_CODE_SUBPROCESS_ENV_SCRUB="${CLAUDE_CODE_SUBPROCESS_ENV_SCRUB:-1}"
 
-# ---- 3. Start proxy ---------------------------------------------------------
+# ---- 3. Proxy — idempotent reuse (autostart adalah source of truth) ---------
+# autostart-proxy.sh (postCreate/postStart, hash-aware) adalah pemilik proxy.
+# run.sh hanya reuse jika sehat; fallback start hanya jika belum nyala.
 # Lokasi target Dockerfile = /opt/csmart/csmart_proxy.py.
 # JANGAN balik ke /sandbox/csmart_proxy.py — itu SALAH & tidak konsisten dgn Dockerfile.
 PROXY_SCRIPT="${CSMART_PROXY_SCRIPT:-/opt/csmart/csmart_proxy.py}"
@@ -42,16 +44,7 @@ PROXY_PORT="${CSMART_PROXY_PORT:-8080}"
 PROXY_LOG="${CSMART_PROXY_LOG:-/tmp/csmart_proxy.log}"
 HEALTH_URL="http://${PROXY_HOST}:${PROXY_PORT}"
 
-if [[ ! -f "$PROXY_SCRIPT" ]]; then
-  echo "ERROR: proxy script tidak ada: ${PROXY_SCRIPT}" >&2
-  echo "  pastikan Dockerfile menaruh csmart_proxy.py di /opt/csmart/." >&2
-  exit 1
-fi
-
-# bersihkan proxy lama yg mungkin tersisa (idempotent)
-pkill -f 'csmart_proxy.py' 2>/dev/null || true
-
-# trap EXIT utk kill proxy saat session berakhir (error path & exit normal non-exec)
+# trap EXIT hanya kill jika run.sh yang start proxy (PROXY_PID terisi); reuse autostart tidak di-kill
 PROXY_PID=""
 cleanup() {
   if [[ -n "$PROXY_PID" ]] && kill -0 "$PROXY_PID" 2>/dev/null; then
@@ -62,32 +55,40 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# start proxy (background, log ke file, tidak terhubung stdin)
-nohup python3 "$PROXY_SCRIPT" </dev/null >"$PROXY_LOG" 2>&1 &
-PROXY_PID=$!
-
-# ---- 4. Poll health (maks ~45s) ---------------------------------------------
+# ---- 4. Health check / fallback start (maks ~45s) ---------------------------
 HEALTH_OK=""
-TIMEOUT_S="${CSMART_HEALTH_TIMEOUT_S:-45}"
-END=$(( SECONDS + TIMEOUT_S ))
-
-while (( SECONDS < END )); do
-  if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
-    HEALTH_OK="yes"
-    break
+if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
+  echo "run.sh: proxy sudah nyala di ${HEALTH_URL} — reuse (autostart)." >&2
+  HEALTH_OK="yes"
+else
+  if [[ ! -f "$PROXY_SCRIPT" ]]; then
+    echo "ERROR: proxy script tidak ada: ${PROXY_SCRIPT}" >&2
+    echo "  pastikan Dockerfile menaruh csmart_proxy.py di /opt/csmart/." >&2
+    exit 1
   fi
-  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-    echo "ERROR: csmart_proxy.py mati sebelum Health. Log:" >&2
+  # fallback: proxy belum nyala — start di sini (mis. docker run manual tanpa postStart)
+  pkill -f 'csmart_proxy.py' 2>/dev/null || true
+  nohup python3 "$PROXY_SCRIPT" </dev/null >"$PROXY_LOG" 2>&1 &
+  PROXY_PID=$!
+  TIMEOUT_S="${CSMART_HEALTH_TIMEOUT_S:-45}"
+  END=$(( SECONDS + TIMEOUT_S ))
+  while (( SECONDS < END )); do
+    if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
+      HEALTH_OK="yes"
+      break
+    fi
+    if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+      echo "ERROR: csmart_proxy.py mati sebelum Health. Log:" >&2
+      tail -n 40 "$PROXY_LOG" >&2
+      exit 1
+    fi
+    sleep 0.5
+  done
+  if [[ -z "$HEALTH_OK" ]]; then
+    echo "ERROR: proxy tidak merespon dalam ${TIMEOUT_S}s. Log:" >&2
     tail -n 40 "$PROXY_LOG" >&2
     exit 1
   fi
-  sleep 0.5
-done
-
-if [[ -z "$HEALTH_OK" ]]; then
-  echo "ERROR: proxy tidak merespon dalam ${TIMEOUT_S}s. Log:" >&2
-  tail -n 40 "$PROXY_LOG" >&2
-  exit 1
 fi
 
 # ---- 5. Jalankan Claude Code (pass CLI args) --------------------------------

@@ -24,6 +24,15 @@ for f in /secrets/.env /secrets/.env.local; do
 done
 # UPSTREAM_API_KEY fallback ke ANTHROPIC_AUTH_TOKEN (sesuai csmart_proxy.py:36)
 export UPSTREAM_API_KEY="${UPSTREAM_API_KEY:-${ANTHROPIC_AUTH_TOKEN:-}}"
+# G3: deny-rules — copy settings.json ke ~/.claude agar attach tanpa run.sh tetap DENY
+mkdir -p "$HOME/.claude"
+if [[ -f "$PWD/sandbox/settings.json" ]]; then
+  cp "$PWD/sandbox/settings.json" "$HOME/.claude/settings.json"
+elif [[ -f "/workspace/sandbox/settings.json" ]]; then
+  cp "/workspace/sandbox/settings.json" "$HOME/.claude/settings.json"
+elif [[ -f "$(dirname "$0")/settings.json" ]]; then
+  cp "$(dirname "$0")/settings.json" "$HOME/.claude/settings.json"
+fi
 nohup python3 /opt/csmart/csmart_proxy.py </dev/null >/tmp/csmart_proxy.log 2>&1 &
 sleep 2
 if curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1; then
