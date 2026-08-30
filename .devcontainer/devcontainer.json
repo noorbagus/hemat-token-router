@@ -1,0 +1,65 @@
+{
+  "name": "hemat-token-router proxy devcontainer (strict JSON)",
+  "description": "Runs the csmart proxy inside the container at http://127.0.0.1:8080. Secrets (CSMART_*, UPSTREAM_BASE_URL, UPSTREAM_API_KEY, OPENAI_API_KEY) are NOT hardcoded here; they are loaded from /secrets/.env by run.sh via postCreateCommand.",
+  "remoteUser": "dev",
+  "build": {
+    "dockerfile": "../sandbox/Dockerfile",
+    "context": ".."
+  },
+  "containerEnv": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8080",
+    "ANTHROPIC_API_KEY": "dummy",
+    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0"
+  },
+  "mounts": [
+    {
+      "type": "bind",
+      "source": "/Volumes/Xugab/LAB/PrivateLink/credentials/.env",
+      "target": "/secrets/.env",
+      "readonly": true
+    },
+    {
+      "type": "bind",
+      "source": "/Volumes/Xugab/LAB/PrivateLink/.env.local",
+      "target": "/secrets/.env.local",
+      "readonly": true
+    },
+    {
+      "type": "bind",
+      "source": "${localWorkspaceFolder}/csmart_proxy.py",
+      "target": "/opt/csmart/csmart_proxy.py",
+      "readonly": true
+    },
+    {
+      "type": "volume",
+      "source": "npm-cache",
+      "target": "/root/.npm"
+    },
+    {
+      "type": "volume",
+      "source": "pip-cache",
+      "target": "/root/.cache/pip"
+    }
+  ],
+  "runArgs": [
+    "--cap-drop=ALL",
+    "--cap-add=NET_ADMIN",
+    "--security-opt",
+    "no-new-privileges"
+  ],
+  "postCreateCommand": "chmod +x \"$PWD/sandbox/run.sh\" \"$PWD/sandbox/autostart-proxy.sh\" && bash \"$PWD/sandbox/autostart-proxy.sh\" && echo 'Sandbox siap. Proxy auto-start OK \u2014 jalankan: sandbox/run.sh'",
+  "postStartCommand": "bash sandbox/autostart-proxy.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.black-formatter",
+        "ms-python.debugpy"
+      ]
+    }
+  },
+  "forwardPorts": [
+    8080
+  ]
+}
