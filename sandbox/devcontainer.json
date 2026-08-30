@@ -1,7 +1,6 @@
 {
   "name": "hemat-token-router proxy devcontainer (strict JSON)",
   "description": "Runs the csmart proxy inside the container at http://127.0.0.1:8080. Secrets (CSMART_*, UPSTREAM_BASE_URL, UPSTREAM_API_KEY, OPENAI_API_KEY) are NOT hardcoded here; they are loaded from /secrets/.env by run.sh via postCreateCommand.",
-  "workspaceFolder": "/workspace",
   "remoteUser": "dev",
   "build": {
     "dockerfile": "Dockerfile",

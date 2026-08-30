@@ -97,6 +97,10 @@ echo "run.sh: proxy siap di ${HEALTH_URL} — menjalankan claude $*"
 mkdir -p "$HOME/.claude"
 if [[ -f "$PWD/sandbox/settings.json" ]]; then
   cp "$PWD/sandbox/settings.json" "$HOME/.claude/settings.json"
+elif [[ -f "/workspaces/hemat-token-router/sandbox/settings.json" ]]; then
+  cp "/workspaces/hemat-token-router/sandbox/settings.json" "$HOME/.claude/settings.json"
+elif [[ -f "/workspace/sandbox/settings.json" ]]; then
+  cp "/workspace/sandbox/settings.json" "$HOME/.claude/settings.json"
 fi
 
 # unsandboxed: container pakai --cap-drop=ALL jadi bubblewrap tidak bisa jalan.
