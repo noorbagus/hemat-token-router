@@ -31,3 +31,6 @@ csmart_state.db
 # OS
 .DS_Store
 Thumbs.db
+
+# opencode local config (berisi secret) — jangan commit
+opencode.json

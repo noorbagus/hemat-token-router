@@ -6,7 +6,7 @@
 # tapi kita pakai iptables-based (lebih portabel) dengan fallback nft.
 #
 # Policy: semua outbound DROP, hanya yang di-allowlist yang boleh keluar:
-#   1. Upstream proxy csmart  -> ${UPSTREAM_BASE_URL} (default api.deepseek.com:443)
+#   1. Upstream proxy csmart  -> ${UPSTREAM_BASE_URL} (default deepseek:443) & opencode:443 (kedua endpoint terpakai)
 #   2. Loopback 127.0.0.0/8   -> agar 127.0.0.1:8080 jalan antar-proses
 #   3. (Opsional, default off) git/registry: registry.npmjs.org, github.com, deb.debian.org
 #
@@ -15,6 +15,9 @@
 set -euo pipefail
 
 UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL:-https://api.deepseek.com/anthropic}"
+# Claude Code preflight reachability check (startup ping) — hardcoded ke api.anthropic.com,
+# terpisah dari jalur model (model I/O tetap via proxy 127.0.0.1:8080 -> opencode).
+ANTHROPIC_PREFLIGHT_HOST="${ANTHROPIC_PREFLIGHT_HOST:-api.anthropic.com}"
 
 # ---- 1. Wajib root ---------------------------------------------------------
 if [[ "$(id -u)" != "0" ]]; then
@@ -29,6 +32,8 @@ if [[ -z "$UPSTREAM_HOST" ]]; then
   echo "ERROR: UPSTREAM_BASE_URL tidak valid: '${UPSTREAM_BASE_URL}'" >&2
   exit 1
 fi
+OPENAI_UPSTREAM_URL="${CSMART_OPENAI_BASE_URL:-${OPENAI_BASE_URL:-https://opencode.ai/zen/go/v1}}"
+OPENAI_HOST=$(echo "$OPENAI_UPSTREAM_URL" | sed -E 's|https?://||' | cut -d'/' -f1 | cut -d':' -f1)
 
 # ---- 3. (Opsional) allowlist git / registry — default OFF --------------------
 # Untuk mengaktifkan, buka comment & isi host yang diizinkan, mis:
@@ -63,8 +68,20 @@ setup_iptables() {
   # 1. loopback 127.0.0.0/8 -> proxy 127.0.0.1:8080 antar-proses
   iptables -A OUTPUT -d 127.0.0.0/8 -j ACCEPT
 
+  # 1b. DNS resolver (UDP/TCP 53) — wajib agar host allowlist bisa resolve.
+  #     Tradeoff: DNS tunneling kecil; tanpa ini semua egress mati (tak bisa resolve).
+  iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+  iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+
   # 2. upstream csmart: TCP 443
   iptables -A OUTPUT -p tcp -d "$UPSTREAM_HOST" --dport 443 -j ACCEPT
+  if [[ "$OPENAI_HOST" != "$UPSTREAM_HOST" && -n "$OPENAI_HOST" ]]; then
+    iptables -A OUTPUT -p tcp -d "$OPENAI_HOST" --dport 443 -j ACCEPT
+  fi
+
+  # 2c. Claude Code preflight ping (startup reachability) -> api.anthropic.com
+  #     Reachability only; model I/O tetap via proxy 127.0.0.1:8080 -> opencode.
+  iptables -A OUTPUT -p tcp -d "$ANTHROPIC_PREFLIGHT_HOST" --dport 443 -j ACCEPT
 
   # 3. (jika diaktifkan) git / registry
   if [[ -n "$GIT_ALLOW" ]]; then
@@ -91,8 +108,17 @@ setup_nft() {
   # 1. loopback
   nft add rule inet csmart_fw output ip daddr 127.0.0.0/8 accept
 
+  # 1b. DNS resolver (UDP/TCP 53) — wajib agar host allowlist bisa resolve
+  nft add rule inet csmart_fw output udp dport 53 accept
+  nft add rule inet csmart_fw output tcp dport 53 accept
+
   # 2. upstream TCP 443
   nft add rule inet csmart_fw output ip daddr "$UPSTREAM_HOST" tcp dport 443 accept
+  if [[ "$OPENAI_HOST" != "$UPSTREAM_HOST" && -n "$OPENAI_HOST" ]]; then
+    nft add rule inet csmart_fw output ip daddr "$OPENAI_HOST" tcp dport 443 accept
+  fi
+
+  nft add rule inet csmart_fw output ip daddr "$ANTHROPIC_PREFLIGHT_HOST" tcp dport 443 accept
 
   # 3. git / registry (opsional)
   if [[ -n "$GIT_ALLOW" ]]; then
@@ -119,5 +145,9 @@ else
 fi
 
 echo "init-firewall.sh: selesai. Egress DENY-BY-DEFAULT aktif."
-echo "  allow: 127.0.0.0/8 (loopback); TCP 443 -> ${UPSTREAM_HOST}"
+if [[ "$OPENAI_HOST" != "$UPSTREAM_HOST" && -n "$OPENAI_HOST" ]]; then
+  echo "  allow: 127.0.0.0/8 (loopback); TCP 443 -> ${UPSTREAM_HOST}, ${OPENAI_HOST}"
+else
+  echo "  allow: 127.0.0.0/8 (loopback); TCP 443 -> ${UPSTREAM_HOST}"
+fi
 echo "  drop : semua outbound lain (git/registry: buka comment GIT_ALLOW)"

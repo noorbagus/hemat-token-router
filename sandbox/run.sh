@@ -13,14 +13,19 @@ set -euo pipefail
 # set -a: export semua var; source file; set +a kembalikan.
 # Hanya baris KEY=VALUE yg dimuat; komentar & quote dibuang.
 # Secret TIDAK di-echo ke output.
-if [[ -f /secrets/.env ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' /secrets/.env | sed -E 's/^([^=]+)=["'"'"']?(.*)["'"'"']?$/\1=\2/')
-  set +a
-else
+for f in /secrets/.env /secrets/.env.local; do
+  if [[ -f "$f" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$f"
+    set +a
+  fi
+done
+if [[ ! -f /secrets/.env ]]; then
   echo "WARN: /secrets/.env tidak ditemukan — lanjut tanpa secrets." >&2
 fi
+# Proxy butuh key asli — simpan ke UPSTREAM_API_KEY sebelum unset untuk Claude nanti
+export UPSTREAM_API_KEY="${UPSTREAM_API_KEY:-${ANTHROPIC_AUTH_TOKEN:-}}"
 
 # ---- 2. Arahkan Claude Code ke proxy lokal ---------------------------------
 # Proxy jalan DI DALAM container ini di 127.0.0.1:8080.
@@ -96,6 +101,11 @@ fi
 # unsandboxed: container pakai --cap-drop=ALL jadi bubblewrap tidak bisa jalan.
 # Override SCRUB=1 dari devcontainer.json agar claude tidak menuntut bwrap.
 export CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0
+# Claude vs proxy: proxy sudah dapat UPSTREAM_API_KEY di atas; untuk Claude
+# cukup ANTHROPIC_API_KEY=dummy — unset token asli agar tidak bentrok auth.
+unset ANTHROPIC_AUTH_TOKEN
+export ANTHROPIC_API_KEY=dummy
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
 
 # Foreground (bukan exec) agar trap EXIT tetap jalan setelah claude keluar
 # dan memastikan proxy csmart ikut di-kill (tidak bocor).

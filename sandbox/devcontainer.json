@@ -8,13 +8,25 @@
   "containerEnv": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8080",
     "ANTHROPIC_API_KEY": "dummy",
-    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1"
+    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0"
   },
   "mounts": [
     {
       "type": "bind",
       "source": "/Volumes/Xugab/LAB/PrivateLink/credentials/.env",
       "target": "/secrets/.env",
+      "readonly": true
+    },
+    {
+      "type": "bind",
+      "source": "/Volumes/Xugab/LAB/PrivateLink/.env.local",
+      "target": "/secrets/.env.local",
+      "readonly": true
+    },
+    {
+      "type": "bind",
+      "source": "${localWorkspaceFolder}/csmart_proxy.py",
+      "target": "/opt/csmart/csmart_proxy.py",
       "readonly": true
     },
     {
@@ -30,10 +42,12 @@
   ],
   "runArgs": [
     "--cap-drop=ALL",
+    "--cap-add=NET_ADMIN",
     "--security-opt",
     "no-new-privileges"
   ],
-  "postCreateCommand": "chmod +x \"$PWD/sandbox/run.sh\" && echo 'Sandbox siap. Jalankan: sandbox/run.sh'",
+  "postCreateCommand": "chmod +x \"$PWD/sandbox/run.sh\" \"$PWD/sandbox/autostart-proxy.sh\" && bash \"$PWD/sandbox/autostart-proxy.sh\" && echo 'Sandbox siap. Proxy auto-start OK — jalankan: sandbox/run.sh'",
+  "postStartCommand": "bash sandbox/autostart-proxy.sh",
   "customizations": {
     "vscode": {
       "extensions": [
