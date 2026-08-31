@@ -1,8 +1,8 @@
 {
   ".claude/settings.local.json": {
-    "mtime": 1788027134.0,
-    "seen": 1788028976.654787,
-    "ast_hash": "3b979f75c333d582b7c83a2c540b4a04",
+    "mtime": 1788045473.0,
+    "seen": 1788106783.6074939,
+    "ast_hash": "a044b397d6dd3ad4d87c904bbb1a35d4",
     "semantic_hash": ""
   },
   "csmart.py": {
@@ -186,9 +186,9 @@
     "semantic_hash": ""
   },
   "CLAUDE.md": {
-    "mtime": 1787933284.0,
-    "seen": 1787936704.725674,
-    "ast_hash": "dd40b329a8e6e1470622543515955434",
+    "mtime": 1788105909.0,
+    "seen": 1788106783.607552,
+    "ast_hash": "f29f224914934e66fc7fb82a1b85cbf6",
     "semantic_hash": ""
   },
   "CONTRACTS.md": {
@@ -264,21 +264,21 @@
     "semantic_hash": ""
   },
   "csmart_proxy.py": {
-    "mtime": 1788028228.0,
-    "seen": 1788028976.654793,
-    "ast_hash": "9731d4495564c9578031ee5498d198ea",
+    "mtime": 1788049671.0,
+    "seen": 1788106783.6075,
+    "ast_hash": "978084ec7ea3540c702c057c15de6824",
     "semantic_hash": ""
   },
   "tests/test_csmart_proxy.py": {
-    "mtime": 1787946211.0,
-    "seen": 1787946505.131856,
-    "ast_hash": "f3192257dddc2264c66be63a7f74eeba",
+    "mtime": 1788031140.0,
+    "seen": 1788031192.0103822,
+    "ast_hash": "2ca764ac6556ef6fd939efff9ca57893",
     "semantic_hash": ""
   },
   "tests/test_csmart_proxy_openai.py": {
-    "mtime": 1788027870.0,
-    "seen": 1788028976.6548202,
-    "ast_hash": "25525d101f4eee186849b369610db178",
+    "mtime": 1788035012.0,
+    "seen": 1788036033.81462,
+    "ast_hash": "7faf797180f8c06d7e6a758c7c07daa8",
     "semantic_hash": ""
   },
   "scripts/litellm-start.sh": {
@@ -294,9 +294,9 @@
     "semantic_hash": ""
   },
   "arsitektur/pipeline/csmart-lite-comparison.md": {
-    "mtime": 1788028917.0,
-    "seen": 1788028976.65484,
-    "ast_hash": "b20eec86db29d57aafa9fea0ea2d2399",
+    "mtime": 1788031167.0,
+    "seen": 1788031192.010405,
+    "ast_hash": "5466e98173dbf121d26ea8dba6df35a8",
     "semantic_hash": ""
   },
   "arsitektur/pipeline/leak-vectors.md": {
@@ -306,15 +306,87 @@
     "semantic_hash": ""
   },
   "arsitektur/pipeline/pipeline.md": {
-    "mtime": 1788028648.0,
-    "seen": 1788028976.6548421,
-    "ast_hash": "a4ddb788348edc362f164135963294a3",
+    "mtime": 1788033073.0,
+    "seen": 1788033080.969911,
+    "ast_hash": "6ad664f67ab967a08388cdc7a02bd21c",
     "semantic_hash": ""
   },
   "litellm.config.yaml": {
     "mtime": 1787954525.0,
     "seen": 1788028976.654845,
     "ast_hash": "f07bcbfb41fc6d1b218245ec352ca359",
+    "semantic_hash": ""
+  },
+  "tests/test_adopt_gaps.py": {
+    "mtime": 1788030592.0,
+    "seen": 1788031192.010379,
+    "ast_hash": "b8bf2b3da8a8c0e7be9980177c6127fc",
+    "semantic_hash": ""
+  },
+  "docs/endpoints-opencode.md": {
+    "mtime": 1788032557.0,
+    "seen": 1788032973.3480299,
+    "ast_hash": "ffaf10f4dd46ccd511ef9c4c76e20ab8",
+    "semantic_hash": ""
+  },
+  "sandbox/devcontainer.json": {
+    "mtime": 1788107048.0,
+    "seen": 1788107202.086436,
+    "ast_hash": "29cf222ca51caa9f467954351ddf04ae",
+    "semantic_hash": ""
+  },
+  "sandbox/init-firewall.sh": {
+    "mtime": 1788044881.0,
+    "seen": 1788106783.607525,
+    "ast_hash": "8ba1682f1386e128113ca9f53f206a98",
+    "semantic_hash": ""
+  },
+  "sandbox/run.sh": {
+    "mtime": 1788107192.0,
+    "seen": 1788107202.086438,
+    "ast_hash": "3d06b74cecefa1c528d772481ffd1e54",
+    "semantic_hash": ""
+  },
+  "sandbox/settings.json": {
+    "mtime": 1788037513.0,
+    "seen": 1788037605.385663,
+    "ast_hash": "0a7875be1373914c659b83e8b9bb4e3f",
+    "semantic_hash": ""
+  },
+  "sandbox/apply-firewall.sh": {
+    "mtime": 1788044139.0,
+    "seen": 1788106783.607522,
+    "ast_hash": "d696f5568056bc0af55da6cce49f42c9",
+    "semantic_hash": ""
+  },
+  "sandbox/autostart-proxy.sh": {
+    "mtime": 1788106836.0,
+    "seen": 1788106902.5632489,
+    "ast_hash": "a72befab83887c73ac594e55137cc4b8",
+    "semantic_hash": ""
+  },
+  ".agent/plans/sandbox-minimal-gap-vscode-attach.md": {
+    "mtime": 1788106677.0,
+    "seen": 1788106783.60755,
+    "ast_hash": "49397497f5d4b37b5fc5385de4a33cef",
+    "semantic_hash": ""
+  },
+  "claudemd-template.md": {
+    "mtime": 1788105552.0,
+    "seen": 1788106783.607562,
+    "ast_hash": "a35d8d5b420569879ab810e837c63311",
+    "semantic_hash": ""
+  },
+  "sandbox/README.md": {
+    "mtime": 1788106883.0,
+    "seen": 1788106902.5633001,
+    "ast_hash": "5839eff7e2abcfccb2cc9df24bbb5906",
+    "semantic_hash": ""
+  },
+  ".devcontainer/devcontainer.json": {
+    "mtime": 1788107965.0,
+    "seen": 1788107984.07625,
+    "ast_hash": "1c7455439d85c89f49360b048eeb3457",
     "semantic_hash": ""
   }
 }

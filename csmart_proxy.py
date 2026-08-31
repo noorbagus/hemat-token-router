@@ -27,11 +27,22 @@ import re
 import sqlite3
 import sys
 import time
+import urllib.request
 import uuid
+import warnings
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+
+try:
+    import tomllib  # Python 3.11+
+except ImportError:  # pragma: no cover
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ImportError:
+        tomllib = None  # type: ignore[assignment]
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -121,6 +132,12 @@ MOCK_MODE = os.getenv("CSMART_MOCK_RESPONSES", "0") == "1"
 # Secret vault at-rest
 VAULT_PERSIST = os.getenv("CSMART_VAULT_PERSIST", "0") == "1"
 VAULT_KEY = os.getenv("CSMART_VAULT_KEY", "")
+
+# Mask style: "hash" (default, zero-info) -> placeholder __CSMART_SEC_<hash>__,
+# tidak ada byte secret pun ikut ke upstream/log. "preserve" (opsional) ->
+# prefix+suffix (mis. sk-ant...90ab); CAVEAT: 10 char ikut ke upstream, hanya
+# dipakai kalau log tracking prefix-suffix memang dibutuhkan.
+MASK_STYLE = os.getenv("CSMART_MASK_STYLE", "hash").strip().lower()
 
 # Keepalive (jaga KV-cache TTL provider, biasanya 5 menit)
 KEEPALIVE_TICK = int(os.getenv("CSMART_KEEPALIVE_TICK", "30"))
@@ -322,14 +339,14 @@ def init_db() -> None:
 # Gitleaks-inspired high-precision patterns: (regex, label). Group 1, bila ada,
 # adalah nilai secret yang akan di-mask (bukan pembungkus assignment).
 SECRET_REGEXES: List[Tuple[str, str]] = [
-    (r"(?i)\bsk-[A-Za-z0-9_-]{20,}", "openai_key"),
     (r"(?i)\bsk-ant-[A-Za-z0-9_-]{20,}", "anthropic_key"),
+    (r"(?i)\bsk_live_[A-Za-z0-9]{16,}", "stripe_live"),
+    (r"(?i)\bsk_test_[A-Za-z0-9]{16,}", "stripe_test"),
+    (r"(?i)\bsk-[A-Za-z0-9_-]{20,}", "openai_key"),
     (r"(?i)\bghp_[A-Za-z0-9]{36}", "github_token"),
     (r"(?i)\bgithub_pat_[A-Za-z0-9_]{20,}", "github_pat"),
     (r"(?i)\bglpat-[A-Za-z0-9_-]{20,}", "gitlab_token"),
     (r"(?i)\bxox[baprs]-[A-Za-z0-9-]{10,}", "slack_token"),
-    (r"(?i)\bsk_live_[A-Za-z0-9]{16,}", "stripe_live"),
-    (r"(?i)\bsk_test_[A-Za-z0-9]{16,}", "stripe_test"),
     (r"(?i)\bAIza[0-9A-Za-z_-]{20,}", "gcp_api_key"),
     (r"(?i)\bya29\.[0-9A-Za-z_-]+", "google_oauth"),
     (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "aws_access_key"),
@@ -345,6 +362,115 @@ SECRET_REGEXES: List[Tuple[str, str]] = [
 ]
 _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 _HEX_RE = re.compile(r"[0-9a-fA-F]{28,}")
+
+
+# =====================================================================
+# 1b. GITLEAKS RULESET (vendored config/gitleaks.toml, ~200 rule).
+# Regex+keyword prefilter diadopsi AGGRESIF (tanpa entropy gate, sesuai
+# filosofi csmart): apapun format yang match langsung di-mask. Kebalikan
+# gitleaks binary (entropy-gated) yang justru loloskan key low-entropy.
+# =====================================================================
+
+@dataclass
+class _Rule:
+    """Satu deteksi secret: regex + prefilter/precision gates."""
+    regex: Any  # re.Pattern
+    ptype: str
+    keywords: Tuple[str, ...] = ()
+    allow_regexes: Tuple[Any, ...] = ()  # per-rule allowlist (gitleaks [[rules.allowlists]])
+    stopwords: Tuple[str, ...] = ()
+    secret_group: int = 0  # 0 = pakai group 1 (atau full match)
+
+
+def _compile_allow_regexes(allowlists: Optional[List[Any]]) -> Tuple[Any, ...]:
+    pats: List[Any] = []
+    for al in allowlists or []:
+        for rx in al.get("regexes") or []:
+            try:
+                pats.append(re.compile(rx))
+            except Exception:
+                continue
+    return tuple(pats)
+
+
+def _rule_stopwords(allowlists: Optional[List[Any]]) -> Tuple[str, ...]:
+    words: List[str] = []
+    for al in allowlists or []:
+        for w in al.get("stopwords") or []:
+            if isinstance(w, str) and w:
+                words.append(w.lower())
+    return tuple(words)
+
+
+def load_gitleaks_rules(path: str) -> Tuple[_Rule, ...]:
+    """Load ~200 gitleaks patterns dari config/gitleaks.toml.
+
+    Soft-fail: file hilang / tomli tidak ada / regex tak tercompile -> di-skip,
+    proxy tetap jalan dengan SECRET_REGEXES bawaan.
+    """
+    rules, _allowed = _load_gitleaks_config(path)
+    return rules
+
+
+def _load_gitleaks_config(path: str) -> Tuple[Tuple[_Rule, ...], Tuple[Any, ...]]:
+    """Return (rules setara _Rule, global allowlist regexes)."""
+    if tomllib is None or not os.path.exists(path):
+        return (), ()
+    try:
+        with open(path, "rb") as fh:
+            data = tomllib.load(fh)
+    except Exception as exc:
+        _log("GITLEAKS_RULES", error=str(exc), path=path)
+        return (), ()
+    rules: List[_Rule] = []
+    skipped = 0
+    for r in data.get("rules") or []:
+        rx = r.get("regex", "")
+        if not rx:
+            continue
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FutureWarning)  # nested-set regex (upstream gitleaks), masih valid
+                pat = re.compile(rx)
+        except Exception:
+            skipped += 1
+            continue
+        rid = r.get("id") or r.get("description") or "unknown"
+        rules.append(
+            _Rule(
+                regex=pat,
+                ptype=f"gitleaks:{rid}",
+                keywords=tuple(k.lower() for k in (r.get("keywords") or []) if isinstance(k, str)),
+                allow_regexes=_compile_allow_regexes(r.get("allowlists")),
+                stopwords=_rule_stopwords(r.get("allowlists")),
+                secret_group=int(r.get("secretGroup") or 0),
+            )
+        )
+    if rules:
+        _log("GITLEAKS_RULES", loaded=len(rules), skipped=skipped, path=os.path.basename(path))
+    global_allow = _compile_allow_regexes([data.get("allowlist") or {}]) if isinstance(data.get("allowlist"), dict) else ()
+    return tuple(rules), global_allow
+
+
+GITLEAKS_TOML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "gitleaks.toml")
+_GITLEAKS_RULES, GLOBAL_ALLOW_PATTERNS = _load_gitleaks_config(GITLEAKS_TOML)
+GITLEAKS_PATTERNS: Tuple[_Rule, ...] = _GITLEAKS_RULES
+
+_ALL_PATTERNS: Tuple[_Rule, ...] = tuple(
+    _Rule(regex=re.compile(rx, re.IGNORECASE if "(?i)" in rx else 0), ptype=pt, keywords=())
+    for rx, pt in SECRET_REGEXES
+) + GITLEAKS_PATTERNS
+
+
+def _secret_value(match: "re.Match[str]", rule: _Rule) -> Optional[str]:
+    """Ambil nilai secret dari match (hormati secretGroup, lalu group 1, lalu full)."""
+    g = match.group(rule.secret_group) if rule.secret_group and match.re.groups >= rule.secret_group else None
+    if isinstance(g, str) and g:
+        return g
+    groups = match.groups()
+    if groups and groups[0]:
+        return groups[0]
+    return match.group(0)
 
 
 def _shannon_entropy(s: str) -> float:
@@ -379,6 +505,7 @@ class SecretVault:
     def __init__(self) -> None:
         self.mem_cache: Dict[str, str] = {}   # mask_id -> real_secret
         self.reverse_cache: Dict[str, str] = {}  # real_secret -> mask_id
+        self.display_map: Dict[str, str] = {}  # display (prefix...suffix) -> real_secret
         self._fernet: Any = None
         if VAULT_PERSIST:
             if _Fernet is None or not VAULT_KEY:
@@ -403,17 +530,40 @@ class SecretVault:
                 secret = self._fernet.decrypt(row["real_secret"].encode("utf-8")).decode("utf-8")
                 self.mem_cache[mask_id] = secret
                 self.reverse_cache[secret] = mask_id
+                display = self._display(secret)
+                if display is None or display == mask_id:
+                    continue
+                existing = self.display_map.get(display)
+                if existing is None or existing == secret:
+                    self.display_map[display] = secret
         except Exception as exc:  # stale key / corrupt row -> ignore
             _log("VAULT_LOAD", error=str(exc))
+
+    def _display(self, secret: str) -> Optional[str]:
+        """Prefix+suffix mask utk log tracking (prefix 6 + '...' + suffix 4).
+
+        None saat secret terlalu pendek (<=10) supaya mask tidak sama dengan
+        aslinya -> fallback ke hash placeholder.
+        """
+        if MASK_STYLE != "preserve" or len(secret) < 11:
+            return None
+        return f"{secret[:6]}...{secret[-4:]}"
 
     def get_or_create_mask(self, secret: str, pattern_type: str) -> str:
         existing = self.reverse_cache.get(secret)
         if existing:
-            return existing
+            return self._display(d) if MASK_STYLE == "preserve" and (d := self.mem_cache[existing]) else existing
         hash_id = hashlib.sha256(secret.encode("utf-8")).hexdigest()[:8]
         mask_id = f"__CSMART_SEC_{hash_id}__"
+        display = self._display(secret) or mask_id
         self.mem_cache[mask_id] = secret
         self.reverse_cache[secret] = mask_id
+        if display != mask_id:
+            existing_disp = self.display_map.get(display)
+            if existing_disp is None or existing_disp == secret:
+                self.display_map[display] = secret
+            else:  # collision prefix+suffix antar secret -> pakai hash biar unik
+                display = mask_id
         try:
             with get_db() as conn:
                 if self._fernet is not None:
@@ -430,19 +580,31 @@ class SecretVault:
                 conn.commit()
         except Exception as exc:
             _log("VAULT_PUT", error=str(exc))
-        return mask_id
+        _log("SECRET_MASKED", mask=display, pattern=pattern_type, len=len(secret))
+        return display
 
     def mask_text(self, text: str) -> str:
         """Two-tier masking: high-precision regex, then selective entropy pass."""
         if not text:
             return text
-        # Tier 1: known secret formats.
-        for pattern, ptype in SECRET_REGEXES:
-            for match in re.finditer(pattern, text):
-                groups = match.groups()
-                val = groups[0] if groups and groups[0] else match.group(0)
-                if isinstance(val, str) and len(val) >= 8:
-                    text = text.replace(val, self.get_or_create_mask(val, ptype))
+        # Tier 1: known secret formats (builtin + gitleaks pattern set).
+        text_lower = text.lower()
+        for rule in _ALL_PATTERNS:
+            if rule.keywords and not any(k in text_lower for k in rule.keywords):
+                continue
+            for match in rule.regex.finditer(text):
+                val = _secret_value(match, rule)
+                if not isinstance(val, str) or len(val) < 8:
+                    continue
+                if rule.allow_regexes and any(a.search(val) for a in rule.allow_regexes):
+                    continue
+                if rule.stopwords and any(s in val.lower() for s in rule.stopwords):
+                    continue
+                if GLOBAL_ALLOW_PATTERNS and any(a.search(val) for a in GLOBAL_ALLOW_PATTERNS):
+                    continue
+                if val.startswith("__CSMART_"):  # jangan re-mask placeholder sendiri
+                    continue
+                text = text.replace(val, self.get_or_create_mask(val, rule.ptype))
         # Tier 2: entropy safety net for unknown-but-likely-secret tokens.
         for word in text.split():
             clean = word.strip("\"'()[]{}<>,;:")
@@ -452,8 +614,10 @@ class SecretVault:
 
     def unmask_text(self, text: str) -> str:
         """Restore secrets on the client-bound path ONLY (never sent upstream)."""
-        if not text or "__CSMART_SEC_" not in text:
+        if not text:
             return text
+        for display, real in list(self.display_map.items()):
+            text = text.replace(display, real)
         for mask_id, real in list(self.mem_cache.items()):
             text = text.replace(mask_id, real)
         return text
@@ -681,6 +845,98 @@ EXPAND_TOOL_SCHEMA: Dict[str, Any] = {
     },
 }
 
+# Tool web search yang DIEKSEKUSI PROXY (bukan tool WebSearch bawaan Claude Code,
+# yang tidak di-expose ke model pihak ketiga). Proxy jalan di host dengan akses
+# internet penuh -> hasil di-feed balik sebagai tool_result ke model.
+WEBSEARCH_TOOL_SCHEMA: Dict[str, Any] = {
+    "name": "csmart_websearch",
+    "description": "Cari informasi terkini dari internet (dieksekusi oleh proxy). Query harus ringkas dan spesifik, dalam bahasa Inggris bila mungkin.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query untuk dicari di web."}
+        },
+        "required": ["query"],
+    },
+}
+
+
+# Backend web search opencode (`OPENCODE_ENABLE_EXA=1`) -> Exa hosted MCP.
+# Public endpoint, TANPA API key (tapi free-tier rate-limited). Ganti backend
+# lama DuckDuckGo (flaky/timeout). Override env `EXA_MCP_URL` untuk custom,
+# mis. `https://mcp.exa.ai/mcp?exaApiKey=...` agar bebas rate limit.
+EXA_MCP_URL = os.getenv("EXA_MCP_URL", "https://mcp.exa.ai/mcp")
+
+
+def _mcp_sse_post(url: str, payload: Dict[str, Any], timeout: int = 25) -> Dict[str, Any]:
+    """POST JSON-RPC ke MCP server (SSE transport), return parsed result dict.
+
+    Response berbentuk SSE: `event: message\\ndata: {jsonrpc result}`. Baris
+    `data: ` berisi payload JSON-RPC lengkap (result/error).
+    """
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": "2024-11-05",
+            # Exa MCP memblok UA default urllib (Python-urllib/3.x) -> 403.
+            "User-Agent": "Mozilla/5.0 (compatible; csmart-proxy/1.0)",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", "replace")
+    for line in raw.splitlines():
+        if line.startswith("data: "):
+            return json.loads(line[6:])
+    raise ValueError("MCP SSE response tidak mengandung event 'data'")
+
+
+def _websearch_exa(query: str, max_results: int = 5) -> str:
+    """Sync web search via Exa hosted MCP (backend yang sama dipakai opencode).
+
+    Stdlib only — tanpa dependency baru & tanpa API key. Exa MCP mengembalikan
+    konten bersih per hasil (Title/URL/Published/Highlights) siap di-feed balik
+    sebagai tool_result ke model.
+    """
+    try:
+        payload: Dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "web_search_exa",
+                "arguments": {"query": query, "numResults": max_results},
+            },
+        }
+        data = _mcp_sse_post(EXA_MCP_URL, payload)
+        result = data.get("result", {})
+        content = result.get("content", []) or []
+        blocks: List[str] = [
+            item["text"].strip()
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text" and item.get("text")
+        ]
+        if not blocks:
+            return f"[csmart_websearch] Tidak ada hasil untuk query {query!r}."
+        joined = "\n\n".join(blocks)
+        # Exa free-tier kadang balas pesan rate-limit/error alih-alih hasil ->
+        # surface sebagai ERROR, bukan "hasil", biar model tahu backend kena limit.
+        if "rate limit" in joined.lower() or "exaApiKey" in joined.lower():
+            return (
+                f"[csmart_websearch] ERROR: Exa MCP rate-limited. "
+                f"Set env EXA_MCP_URL dengan Exa API key (mcp.exa.ai/mcp?exaApiKey=...) "
+                f"untuk query {query!r}."
+            )
+        return (
+            f"[csmart_websearch] {len(blocks)} hasil (Exa MCP) untuk {query!r}:\n"
+            + joined
+        )
+    except Exception as exc:
+        return f"[csmart_websearch] ERROR: {exc}"
+
 
 def store_ccr_payload(payload_type: str, content: str) -> Tuple[str, str]:
     """Persist a large payload to SQLite, return (ref_id, compact stub)."""
@@ -731,6 +987,8 @@ def align_prefix_3_region(payload: Dict[str, Any]) -> Dict[str, Any]:
     names = [t.get("name") for t in tools if isinstance(t, dict)]
     if "csmart_expand_symbol" not in names:
         tools.append(EXPAND_TOOL_SCHEMA)
+    if "csmart_websearch" not in names:
+        tools.append(WEBSEARCH_TOOL_SCHEMA)
     tools = sorted(tools, key=lambda t: t.get("name", ""))
 
     if tools:
@@ -2198,7 +2456,7 @@ class ProxyStreamer:
                     info = held_by_index[index]
                     tool_input = self._join_input(info["input_parts"])
                     err = check_security_guardrails(info["name"], tool_input)
-                    if info["name"] == "csmart_expand_symbol" or err:
+                    if info["name"] in ("csmart_expand_symbol", "csmart_websearch") or err:
                         if err:
                             info["blocked_reason"] = err
                         held_indices.add(index)
@@ -2270,6 +2528,16 @@ class ProxyStreamer:
                     "Eksekusi dicegat oleh proxy — jangan ulangi; gunakan tool lain."
                 ),
             }
+        if block["name"] == "csmart_websearch":
+            query = (tool_input or {}).get("query")
+            if not query:
+                return {
+                    **block,
+                    "input": tool_input,
+                    "content": "ERROR: csmart_websearch memerlukan argumen 'query'.",
+                }
+            content = _websearch_exa(str(query))
+            return {**block, "input": tool_input, "content": content}
         if block["name"] == "csmart_expand_symbol":
             ref_id = (tool_input or {}).get("ref_id")
             if not ref_id:

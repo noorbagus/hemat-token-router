@@ -226,6 +226,17 @@ def test_entropy_false_positive_untouched():
     assert cp.vault.mask_text(sample) == sample
 
 
+def test_gitleaks_ruleset_loaded_and_masks():
+    """Ekstensi gitleaks (~200 rule) ter-load dan men-mask format yang tidak
+    tercakup SECRET_REGEXES bawaan (contoh: Age secret key)."""
+    assert len(cp.GITLEAKS_PATTERNS) >= 100
+    secret = "AGE-SECRET-KEY-1XQ9NR637CN8LUNK0APJG5PDR5R4DRWCLJ9YWD7KFRGXW2VUK2DVSE65EF8"
+    text = f"config={secret}"
+    masked = cp.vault.mask_text(text)
+    assert secret not in masked
+    assert cp.vault.unmask_text(masked) == text
+
+
 def test_vault_at_rest_real_secret_is_null():
     """Default vault = in-memory only: real_secret TIDAK pernah plaintext di DB."""
     secret = "sk-test-111111111111111111111111"

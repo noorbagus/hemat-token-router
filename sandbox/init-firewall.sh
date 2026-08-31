@@ -40,6 +40,15 @@ OPENAI_HOST=$(echo "$OPENAI_UPSTREAM_URL" | sed -E 's|https?://||' | cut -d'/' -
 #   GIT_ALLOW="registry.npmjs.org github.com deb.debian.org"
 GIT_ALLOW="${GIT_ALLOW:-}"
 
+# ---- 3b. (Opsional) VS Code server bootstrap — default OFF --------------------
+# Hanya dibutuhkan SEKALI saat attach pertama: VS Code men-download vscode-server
+# ke ~/.vscode-server di dalam container dari host VS Code (update.code.visualstudio.com
+# + CDN az764295.vo.msecnd.net, dll). Setelah ter-cache, normalnya tak download lagi,
+# jadi matikan VAR ini + re-apply utk balik ke strict deny-by-default.
+# Contoh:
+#   VSCODE_ALLOW="update.code.visualstudio.com az764295.vo.msecnd.net vscode.download.prss.microsoft.com"
+VSCODE_ALLOW="${VSCODE_ALLOW:-}"
+
 # ---- 4. Pilih engine: iptables (portable), fallback nft ----------------------
 FIREWALL_ENGINE="${FIREWALL_ENGINE:-iptables}"
 if ! command -v iptables >/dev/null 2>&1; then
@@ -91,6 +100,13 @@ setup_iptables() {
     done
   fi
 
+  # 3b. (jika diaktifkan) VS Code server bootstrap (bootstrap-only; matikan setelah attach)
+  if [[ -n "$VSCODE_ALLOW" ]]; then
+    for host in $VSCODE_ALLOW; do
+      iptables -A OUTPUT -p tcp -d "$host" --dport 443 -j ACCEPT
+    done
+  fi
+
   echo "iptables: egress deny-by-default terpasang (policy DROP)."
 }
 
@@ -128,6 +144,13 @@ setup_nft() {
     done
   fi
 
+  # 3b. VS Code server bootstrap (opsional; matikan setelah attach)
+  if [[ -n "$VSCODE_ALLOW" ]]; then
+    for host in $VSCODE_ALLOW; do
+      nft add rule inet csmart_fw output ip daddr "$host" tcp dport 443 accept
+    done
+  fi
+
   echo "nft: egress deny-by-default terpasang (chain policy drop)."
 }
 
@@ -151,3 +174,6 @@ else
   echo "  allow: 127.0.0.0/8 (loopback); TCP 443 -> ${UPSTREAM_HOST}"
 fi
 echo "  drop : semua outbound lain (git/registry: buka comment GIT_ALLOW)"
+if [[ -n "$VSCODE_ALLOW" ]]; then
+  echo "  note : VS_CODE_BOOTSTRAP aktif -> TCP 443 ke: $VSCODE_ALLOW (matikan + re-apply stlh attach)"
+fi

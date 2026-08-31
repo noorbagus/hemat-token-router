@@ -23,5 +23,5 @@ if [[ -z "$CONTAINER" ]]; then
 fi
 
 echo "apply-firewall: menerapkan firewall ke container $CONTAINER ..."
-docker exec -u 0 "$CONTAINER" /opt/csmart/init-firewall.sh
+docker exec -u 0 -e VSCODE_ALLOW="${VSCODE_ALLOW:-}" "$CONTAINER" /opt/csmart/init-firewall.sh
 echo "apply-firewall: selesai."

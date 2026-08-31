@@ -31,6 +31,12 @@
       "readonly": true
     },
     {
+      "type": "bind",
+      "source": "${localWorkspaceFolder}",
+      "target": "/workspace",
+      "readonly": true
+    },
+    {
       "type": "volume",
       "source": "npm-cache",
       "target": "/root/.npm"

@@ -1,3 +1,143 @@
+Always respond directly and concisely. Never show internal reasoning, thinking steps, or interpretation process before answering.
+
+# Format Komunikasi
+- **Ringkas** - jawab langsung, tanpa basa-basi.
+- **Tabel** untuk perbandingan, status, langkah, checklist.
+- **Bold** untuk kata penting / judul.
+- **Istilah teknis pakai bahasa Inggris** - JANGAN diterjemahkan kalau ambigu/membingungkan: **deploy**, **monitoring**, **observability**, **dependency**, **testing/debugging**. Bahasa Indonesia hanya untuk kata umum yang terjemahannya jelas & alami (mis. "buka website", "login", "upload"). Kalau ragu, pakai istilah Inggris + penjelasan singkat dalam kurung saat pertama muncul.
+
+# Keamanan Credential — WAJIB (berlaku semua credential)
+
+Berlaku untuk **semua jenis credential**: env var, API key, access key, token, JWT, password, secret, passphrase, cookie sesi, koneksi string. **Bukan cuma AWS.**
+
+1. **JANGAN pernah print/cetak isi credential** di chat, log, output command, atau file — isi apapun jenisnya.
+2. **Selalu mask saat menampilkan**: tampilkan hanya `panjang`, `prefix` (4-6 char), dan `suffix` (last 4) — contoh `sk-ws-...dWpg`, `LTAI5t...`, `***MASKED***`. Nilai penuh tidak boleh muncul.
+3. **Credential hanya boleh hidup di env / secret store / keychain**, tidak di source code, chat, atau git.
+4. **Saat test/verify kredensial** (curl/CLI ke API): gunakan output **mask**, sertakan cuma status (`HTTP 200` / `401` / error) tanpa body rahasia. Jangan echo key, jangan print header Authorization.
+5. **`.env` & file key WAJIB di `.gitignore`** — cek sebelum commit.
+6. **Locate (dimana) = boleh disebut; isi (valuenya) = TIDAK boleh.** Kalau user minta "cari login/credential", jawab *lokasi + format + status valid*, JANGAN berikan isi.
+7. **AccessKey vs API key itu beda**: AccessKey (RAM/IAM) scope akun cloud penuh; API key (mis. `DASHSCOPE_API_KEY`) scope workspace/layanan. Jangan pakai yang satu untuk keperluan yang lain.
+8. **WAJIB fail-safe mask — output = derived, bukan echoed** untuk perintah apa pun yang menyentuh file credential (AWS, Tencent, Google/GCP, Azure, Alibaba/Aliyun, DigitalOcean, Hetzner, dan SaaS lain). **JANGAN pernah `cat`/`grep`/`head`/`awk`/`tail`/`sed` non-fail-safe langsung** ke `~/.aws/credentials`, `~/.aws/config`, `~/.config/gcloud/*`, `~/.tencentcloud/*`, file `.csv` access-key, `.env`, atau file credential lain. Prinsip: tiap baris output di-mask ATAU jadi placeholder — **TIDAK ada pass-through** (`sed` yang cuma mask baris match = bahaya, baris tak-match lolos mentah). Value hanya hidup di variable/file/internal, tidak pernah di output, history, atau chat. Berlaku juga untuk perintah read-only ("cek profile" / "list config") — file credential selalu mengandung secret plaintext.
+
+   **Pola aman READ (output cuma turunan — hash/length/prefix-suffix/status):**
+   ```bash
+   # Metadata aja (paling aman — 0% bocor)
+   shasum -a 256 path/to/.env
+   stat -c "%a %s bytes" path/to/.env          # linux (mac: stat -f "%Sp %z bytes")
+
+   # Key name saja (value tidak pernah disentuh)
+   grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' .env | tr -d '='
+
+   # Kehadiran key (boolean)
+   grep -q '^DATABASE_URL=' .env && echo present || echo missing
+
+   # Length per key (tanpa isi)
+   awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/{v=substr($0,length($1)+2); print $1" len="length(v)}' .env
+
+   # FAIL-SAFE preview (prefix+suffix+len) — pengganti sed pass-through
+   awk -F= '
+     /^[A-Za-z_][A-Za-z0-9_]*=/{
+       v=substr($0,length($1)+2);
+       printf "%s=%s...%s (%d chars)\n", $1, substr(v,1,6), substr(v,length(v)-3,4), length(v);
+       next
+     } {print "[MASKED]"}
+   ' .env
+
+   # Round-trip compare file vs Secret Store (value TIDAK pernah keluar)
+   # Linux: secret-tool (libsecret) / pass / keepassxc-cli; mac: security (Keychain)
+   cmp -s <(grep -m1 '^KEY=' .env | cut -d= -f2-) \
+          <(secret-tool lookup service "name") \
+     && echo MATCH || echo MISMATCH
+
+   # AWS — native mask, aman bawaan
+   aws configure list --profile <name>
+   aws sts get-caller-identity --profile <name>
+   aws iam list-access-keys --user-name <user> --profile <name>   # access key ID = bukan rahasia
+
+   # Service account JSON — field non-rahasia + hash saja, JANGAN jq '.private_key'
+   jq '{type, project_id, client_email}' path/to/sa.json
+   shasum -a 256 path/to/sa.json
+
+   # Verify live — status saja, token via env var (bukan inline di command)
+   set -a; source <(grep '^KEY=' .env); set +a
+   curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $KEY" https://api.example.com/verify
+   ```
+
+   **Pola aman WRITE/UPDATE/DELETE (value tak pernah lewat chat/history):**
+   ```bash
+   # Secret store yang dipakai (Linux):
+   #   secret-tool   — libsecret/GNOME Keyring (paling umum)
+   #   pass          — passwordstore, file GPG-encrypted
+   #   keepassxc-cli — KeePassXC (bisa pakai keyfile/db)
+   #   systemd-ask-password — wrapper untuk service systemd
+   # Pilih 1 dan konsisten; pada mac pakai `security` (Keychain).
+
+   # File → Secret Store (value dibaca di dalam command, tak pernah tampil)
+   # secret-tool store --label="<label>" service "name" user "$USER" \
+   #   <<< "$(grep -m1 '^KEY=' .env | cut -d= -f2-)"
+   # pass insert -f "name" \
+   #   <<< "$(grep -m1 '^KEY=' .env | cut -d= -f2-)"
+
+   # Secret Store → file / server (langsung, tanpa lewat chat)
+   secret-tool lookup service "name" > /tmp/x && chmod 600 /tmp/x && mv /tmp/x ./secret
+   secret-tool lookup service "name" | ssh -i key.pem user@host "umask 077; cat > /app/.env"
+
+   # Input manual — tidak masuk history
+   read -s SECRET && printf 'KEY=%s\n' "$SECRET" >> .env && chmod 600 .env && unset SECRET
+
+   # Update 1 key (rewrite via var, bukan ketik value)
+   v=$(secret-tool lookup service "name")
+   grep -v '^KEY=' .env > .env.tmp && printf 'KEY=%s\n' "$v" >> .env.tmp && mv .env.tmp .env && chmod 600 .env && unset v
+
+   # Delete 1 key / dari Secret Store
+   grep -v '^OLD_KEY=' .env > .env.tmp && mv .env.tmp .env && chmod 600 .env
+   secret-tool clear service "name"           # atau: pass rm "name"
+   ```
+
+   **⛔ DILARANG (bocor otomatis ke output):**
+   | Perintah | Alasan |
+   |----------|--------|
+   | `cat`/`head`/`tail` file credential | value penuh keluar |
+   | `printenv` / `env` | dump SEMUA secret |
+   | `sed` non-fail-safe | baris tak-match pass-through |
+   | `docker inspect` / `compose config` mentah | env + secret ikut keluar |
+   | `curl -H "Authorization: ..."` inline | token ke history + ps |
+   | `jq .` file JSON penuh | semua field termasuk private_key |
+   | `grep -A/-B` context di credential | context lines = value |
+   | `echo $SECRET` | value ke output |
+
+   Kalau lupa dan secret sempat tercetak: anggap **terekspos**, segera laporkan ke user + masukkan ke daftar rotasi.
+
+### Command Equivalents: macOS → Linux
+
+| Fungsi | macOS | Linux |
+|--------|-------|-------|
+| Sudo + GUI auth popup | `osascript -e 'do shell script "sudo <cmd>" with administrator privileges'` | `pkexec <cmd>` (PolicyKit GUI prompt) |
+| Popup input field (teks) | `osascript -e 'display dialog "..." default answer ""'` | `zenity --entry --text "..."` (GTK) / `kdialog --inputbox "..."` (KDE) |
+| Popup password field | `osascript -e 'display dialog "..." with hidden answer'` | `zenity --password` / `kdialog --password` |
+| Popup file picker | `osascript -e 'choose file'` | `zenity --file-selection` / `kdialog --getopenfilename` |
+| Clipboard | `pbcopy` / `pbpaste` | `xclip` / `xsel` (X11) / `wl-copy` / `wl-paste` (Wayland) |
+
+Catatan:
+- `pkexec` butuh PolicyKit (polkit) terpasang dan sesi GUI aktif (tidak jalan di headless/SSH tanpa `DISPLAY`/`WAYLAND_DISPLAY`). Di headless pakai `sudo -v` + `read -s` manual, atau `systemd-ask-password`.
+- Output `zenity`/`kdialog` = nilai dari field → jangan di-echo; langsung pipe ke file/store yang 600, atau assign ke variabel lalu `unset`.
+- Contoh input field aman (value tak pernah lewat chat):
+   ```bash
+   # mac: osascript -e 'display dialog "KEY?" default answer ""' | ...
+   # linux (GTK):
+   secret=$(zenity --entry --title "KEY" --text "Masukkan value KEY" --hide-text)
+   printf 'KEY=%s\n' "$secret" >> .env && chmod 600 .env && unset secret
+   ```
+
+# Karpathy Guidelines (LLM coding pitfalls)
+
+_Sumber: https://github.com/forrestchang/andrej-karpathy-skills_
+
+1. **Think Before Coding** - Jangan asumsi. State asumsi eksplisit, present tradeoffs, kalau tidak jelas berhenti & tanya.
+2. **Simplicity First** - Kode minimal yang solve masalah. Tidak ada fitur spekulatif, abstraksi untuk 1 use, error handling untuk skenario mustahil.
+3. **Surgical Changes** - Sentuh cuma yang perlu. Jangan "improve" kode sekeliling. Match style existing. Buang import/var yang jadi orphan karena perubahanmu.
+4. **Goal-Driven Execution** - Transform task jadi verifiable goal: "Add validation" → "tulis test untuk invalid input, lalu buat pass". Loop sampai verified.
+
 # csmart - Claude Smart Local Routing
 
 Token-optimized CLI proxy for Claude Code: Local AST scanning + Ollama-based routing selects only relevant context before dispatching to Claude Code. Reduces token usage by **60-90%** for large codebases.
@@ -208,12 +348,6 @@ $ csmart --json --dry-run "Fix indentation error in csmart.py"
 
 # General Guidelines (dari global CLAUDE.md)
 
-## Format Komunikasi
-- **Ringkas** - jawab langsung, tanpa basa-basi.
-- **Tabel** untuk perbandingan, status, langkah, checklist.
-- **Bold** untuk kata penting / judul.
-- **Istilah teknis pakai bahasa Inggris** - JANGAN diterjemahkan kalau ambigu/membingungkan: **deploy**, **monitoring**, **observability**, **dependency**, **testing/debugging**. Bahasa Indonesia hanya untuk kata umum yang terjemahannya jelas & alami (mis. "buka website", "login", "upload"). Kalau ragu, pakai istilah Inggris + penjelasan singkat dalam kurung saat pertama muncul.
-
 ## Anti-Spaghetti Coding Rules
 
 Gejala spaghetti khas AI - waspadai:
@@ -310,12 +444,3 @@ Kalau graph belum ada: `graphify update .` (build graph, no LLM, code-only).
 **Larangan:** jangan baca `graph.json` mentah (ledakkan context); jangan baca semua file untuk "paham konteks".
 
 **Update graph:** `graphify update .` (no LLM) setelah edit code; `git pull` → `graphify update .`; auto per commit via `graphify hook install`.
-
-## Karpathy Guidelines (LLM coding pitfalls)
-
-_Sumber: https://github.com/forrestchang/andrej-karpathy-skills_
-
-1. **Think Before Coding** - Jangan asumsi. State asumsi eksplisit, present tradeoffs, kalau tidak jelas berhenti & tanya.
-2. **Simplicity First** - Kode minimal yang solve masalah. Tidak ada fitur spekulatif, abstraksi untuk 1 use, error handling untuk skenario mustahil.
-3. **Surgical Changes** - Sentuh cuma yang perlu. Jangan "improve" kode sekeliling. Match style existing. Buang import/var yang jadi orphan karena perubahanmu.
-4. **Goal-Driven Execution** - Transform task jadi verifiable goal: "Add validation" → "tulis test untuk invalid input, lalu buat pass". Loop sampai verified.
