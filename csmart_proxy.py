@@ -63,11 +63,10 @@ except ImportError:  # pragma: no cover
 # ENV LOADING (mirror router/cli_dispatch.py:36-37,130-131)
 # =====================================================================
 def _load_gateway_env() -> None:
-    """Load the PrivateLink gateway env files so ANTHROPIC_AUTH_TOKEN is found
+    """Load the single source env file (.env.local) so keys are found
     even when only the proxy script is started (no prior env export)."""
     for path in (
-        "/Volumes/Xugab/LAB/PrivateLink/credentials/.env",
-        "/Volumes/Xugab/LAB/PrivateLink/.env.local",
+        "/Volumes/Xugab/LAB/Tria/hemat-token-router/.env.local",
     ):
         if load_dotenv is not None and os.path.exists(path):
             load_dotenv(path, override=False)
@@ -1451,10 +1450,23 @@ def _resolve_reasoning_effort(payload: Dict[str, Any]) -> Optional[str]:
             return _clamp(effort)
     thinking = payload.get("thinking")
     if isinstance(thinking, dict):
-        # thinking.enabled=true + budget_tokens → medium; thinking absent → None
         if thinking.get("type") == "disabled" or thinking.get("enabled") is False:
             return None
         if thinking.get("enabled") is True or thinking.get("type") == "enabled":
+            # Honor explicit thinking.effort if present
+            explicit = thinking.get("effort")
+            if isinstance(explicit, str) and explicit.strip().lower() in _ALLOWED:
+                return _clamp(explicit)
+            # Map Anthropic budget_tokens -> OpenAI Responses effort
+            budget = thinking.get("budget_tokens")
+            if isinstance(budget, int) and budget > 0:
+                if budget >= 16000:
+                    return "xhigh"
+                if budget >= 8000:
+                    return "high"
+                if budget >= 2000:
+                    return "medium"
+                return "low"
             return "medium"
     env_override = os.getenv("CSMART_REASONING_EFFORT", "").strip().lower()
     if env_override:
@@ -1935,6 +1947,17 @@ async def transform_openai_responses_sse_to_anthropic(
             elif item.get("type") == "message" and not sent_message_start:
                 yield "message_start", _ms_payload()
                 sent_message_start = True
+            elif item.get("type") == "reasoning":
+                if not sent_message_start:
+                    yield "message_start", _ms_payload()
+                    sent_message_start = True
+                if not thinking_block_open:
+                    yield "content_block_start", {
+                        "type": "content_block_start",
+                        "index": thinking_index,
+                        "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                    }
+                    thinking_block_open = True
             continue
 
         # ---- tool call args streaming ------------------------------------
@@ -2019,6 +2042,17 @@ async def transform_openai_responses_sse_to_anthropic(
                                     "index": 0,
                                     "delta": {"type": "text_delta", "text": txt},
                                 }
+            elif item.get("type") == "reasoning":
+                if thinking_block_open:
+                    enc = item.get("encrypted_content", "")
+                    if enc:
+                        yield "content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": thinking_index,
+                            "delta": {"type": "signature_delta", "signature": enc},
+                        }
+                    yield "content_block_stop", {"type": "content_block_stop", "index": thinking_index}
+                    thinking_block_open = False
             continue
 
         # ---- reasoning / thinking stream (Responses API) ------------------
